@@ -35,10 +35,6 @@ type WalletInfo = {
   kind: "external" | "privy";
 };
 
-function isExternalWalletType(walletType: string): boolean {
-  return !/(^|[_-])(privy|embedded)([_-]|$)/i.test(walletType);
-}
-
 function normalizeAddress(value: unknown): string | null {
   return typeof value === "string" && /^0x[0-9a-fA-F]{40}$/.test(value)
     ? value.toLowerCase()
@@ -206,24 +202,44 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const extractWalletInfo = useCallback((): WalletInfo | null => {
     if (!user) return null;
-    const connectedWallets = (wallets as any[] || [])
-      .map((wallet) => ({ address: normalizeAddress(wallet?.address), wallet }))
-      .filter((item): item is { address: string; wallet: any } => Boolean(item.address));
-    const connectedExternal = connectedWallets.find((item) => isExternalWallet(item.wallet));
-    if (connectedExternal) return walletInfo(connectedExternal.address, connectedExternal.wallet, "external");
-    const connected = connectedWallets[0];
-    if (connected) return walletInfo(connected.address, connected.wallet, "privy");
 
     const linkedAccounts = ((user as any).linkedAccounts as any[] | undefined) || [];
     const linkedWallets = linkedAccounts
       .map((account) => ({ address: normalizeAddress(account?.address), account }))
       .filter((item): item is { address: string; account: any } => Boolean(item.address));
+    const embeddedWallet = (user as any).wallet;
+    const embeddedAddress = normalizeAddress(embeddedWallet?.address);
+
+    /*
+      Every address Privy says belongs to THIS signed-in account.
+
+      useWallets() reports whatever the browser has connected, which is not the
+      same question. A MetaMask extension auto-connects on page load regardless
+      of who is signed in, so a merchant logging in with Google was handed their
+      MetaMask address — an address that account never linked — and the server
+      then correctly refused it with "Wallet address is not linked to the
+      authenticated Privy user". Filter to what Privy actually vouches for.
+    */
+    const ownedAddresses = new Set(
+      [...linkedWallets.map((item) => item.address), embeddedAddress].filter(Boolean) as string[],
+    );
+
+    const connectedWallets = (wallets as any[] || [])
+      .map((wallet) => ({ address: normalizeAddress(wallet?.address), wallet }))
+      .filter((item): item is { address: string; wallet: any } => Boolean(item.address))
+      // If Privy exposed no linkage at all, trust the connection rather than
+      // locking the merchant out of their own dashboard.
+      .filter((item) => ownedAddresses.size === 0 || ownedAddresses.has(item.address));
+
+    const connectedExternal = connectedWallets.find((item) => isExternalWallet(item.wallet));
+    if (connectedExternal) return walletInfo(connectedExternal.address, connectedExternal.wallet, "external");
+    const connected = connectedWallets[0];
+    if (connected) return walletInfo(connected.address, connected.wallet, "privy");
+
     const linkedExternal = linkedWallets.find((item) => isExternalWallet(item.account));
     if (linkedExternal) return walletInfo(linkedExternal.address, linkedExternal.account, "external");
 
-    const wallet = (user as any).wallet;
-    const userWalletAddress = normalizeAddress(wallet?.address);
-    if (userWalletAddress) return walletInfo(userWalletAddress, wallet, "privy");
+    if (embeddedAddress) return walletInfo(embeddedAddress, embeddedWallet, "privy");
     const linked = linkedWallets[0];
     return linked ? walletInfo(linked.address, linked.account, "privy") : null;
   }, [user, wallets]);
@@ -244,6 +260,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return { message, signature, timestamp, walletType };
   }, [user, wallets]);
 
+  // Privy hands back a fresh `wallets` array on many renders, so the two
+  // callbacks above change identity constantly. Account setup reads them
+  // through refs and keys itself on the resolved address instead. Depending on
+  // the callbacks — and on `walletAddress`, which the effect assigns itself —
+  // restarted the effect on almost every render, and each restart re-ran the
+  // wallet signature it used to request up front. That is the repeated popup.
+  const extractWalletInfoRef = useRef(extractWalletInfo);
+  const signWalletProofRef = useRef(signWalletProof);
+  const userRef = useRef(user);
+  useEffect(() => {
+    extractWalletInfoRef.current = extractWalletInfo;
+    signWalletProofRef.current = signWalletProof;
+    userRef.current = user;
+  });
+
+  const resolvedWallet = extractWalletInfo();
+  const resolvedAddress = resolvedWallet?.address ?? null;
+  const resolvedWalletKind = resolvedWallet?.kind ?? null;
+
+  // At most one signature prompt per wallet per retry, shared by every effect
+  // run. A rejected prompt stays rejected until the merchant taps Retry, which
+  // bumps retryCount and so changes the key.
+  const walletProofRef = useRef<{ key: string; promise: ReturnType<typeof signWalletProof> } | null>(null);
+
   useEffect(() => {
     if (!ready) return;
 
@@ -251,6 +291,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setApiKey(null);
       setWalletAddress(null);
       setError(null);
+      setIsLoading(false);
       clearStoredDashboardAuth(walletAddress);
       clearDashboardQueryCache();
       return;
@@ -261,8 +302,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return;
     }
 
-    const walletInfo = extractWalletInfo();
-    if (!walletInfo) return;
+    const walletInfo = extractWalletInfoRef.current();
+    // Every path that returns without starting a run has to release the
+    // spinner, or an aborted predecessor leaves isLoading stuck true forever.
+    if (!walletInfo) { setIsLoading(false); return; }
     const addr = walletInfo.address;
 
     const storedWallet = localStorage.getItem(WALLET_KEY);
@@ -283,6 +326,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const existingKeyWallet = localStorage.getItem(WALLET_KEY);
     if (existingKey && existingKeyWallet === addr) {
       setApiKey(existingKey);
+      setIsLoading(false);
       return;
     }
 
@@ -308,10 +352,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         headers["Authorization"] = `Bearer ${authToken}`;
 
         // Derive a display name from the Privy user object
+        const privyUser = userRef.current as any;
         const derivedName: string =
-          (user as any)?.google?.name ||
-          (user as any)?.email?.address?.split("@")?.[0] ||
+          privyUser?.google?.name ||
+          privyUser?.email?.address?.split("@")?.[0] ||
           "My Store";
+
+        // Signing is a fallback, not a step. The server already proves this
+        // wallet belongs to the Privy user from the access token alone
+        // (assertPrivyWalletOwnership); a signature is only needed when that
+        // lookup itself fails. Nothing is being paid at sign-in, so asking for
+        // one up front bought no security and cost every merchant a popup.
+        const requestWalletProof = () => {
+          const key = `${addr}:${retryCount}`;
+          if (walletProofRef.current?.key !== key) {
+            walletProofRef.current = { key, promise: signWalletProofRef.current(addr, walletInfo.walletType) };
+          }
+          return walletProofRef.current.promise;
+        };
 
         const registerMerchant = async (walletProof?: Awaited<ReturnType<typeof signWalletProof>>) => fetch("/api/merchant/register", {
           method: "POST",
@@ -320,19 +378,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           signal: controller.signal,
         });
 
-        const initialWalletProof = walletInfo.kind === "external" && isExternalWalletType(walletInfo.walletType)
-          ? await signWalletProof(addr, walletInfo.walletType)
-          : null;
-
-        let res = await registerMerchant(initialWalletProof);
+        let res = await registerMerchant();
 
         if (controller.signal.aborted) return;
 
         if (!res.ok) {
           let body = await res.json().catch(() => null);
-          if (["PRIVY_USER_LOOKUP_FAILED", "PRIVY_CONFIG_MISSING", "PRIVY_WALLET_MISMATCH"].includes(body?.code)) {
+          // PRIVY_WALLET_MISMATCH is deliberately absent. That code means Privy
+          // answered and said this wallet is not linked to the account, which a
+          // signature cannot overrule - retrying with one only popped a
+          // surprise prompt after a MetaMask account switch and then registered
+          // a second, empty merchant.
+          if (["PRIVY_USER_LOOKUP_FAILED", "PRIVY_CONFIG_MISSING"].includes(body?.code)) {
             const walletProof = walletInfo.kind === "external"
-              ? await signWalletProof(addr, walletInfo.walletType)
+              ? await requestWalletProof()
               : null;
             if (walletProof && !controller.signal.aborted) {
               res = await registerMerchant(walletProof);
@@ -377,7 +436,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setLocation("/dashboard");
         }
       } catch (err: any) {
-        if (err?.name === "AbortError") return;
+        // A superseded run finishing late must not clear the key, the storage or
+        // the error state belonging to the run that replaced it.
+        if (err?.name === "AbortError" || controller.signal.aborted) return;
         setApiKey(null);
         clearStoredDashboardAuth(addr);
         clearDashboardQueryCache();
@@ -407,7 +468,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         retryTimerRef.current = null;
       }
     };
-  }, [authenticated, user, ready, retryCount, extractWalletInfo, getAccessToken, setLocation, signWalletProof, walletAddress, clearDashboardQueryCache]);
+  // Primitives only. `user`, `wallets` and the callbacks derived from them
+  // change identity constantly, and `walletAddress` is assigned by this very
+  // effect — listing any of them re-entered account setup on every render.
+  }, [authenticated, ready, resolvedAddress, resolvedWalletKind, retryCount, getAccessToken, setLocation, clearDashboardQueryCache]);
 
   const login = useCallback(async () => {
     setError(null);
@@ -425,6 +489,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = useCallback(() => {
     if (abortRef.current) abortRef.current.abort();
+    // Both survive a logout otherwise, so a previously rejected signature would
+    // be replayed on the next login and reported as cancelled without ever
+    // showing the merchant a prompt.
+    walletProofRef.current = null;
+    setRetryCount(0);
     if (retryTimerRef.current) {
       clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;

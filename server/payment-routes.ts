@@ -255,8 +255,26 @@ paymentRouter.post("/merchant/register", async (req, res) => {
     const name = (typeof rawName === "string" && rawName.trim().length > 0)
       ? rawName.trim().slice(0, 120)
       : fallbackName;
-    const proofOwnership = await verifyRegistrationWalletProof(identity, addr, walletProof);
-    const walletOwnership = proofOwnership ?? await assertPrivyWalletOwnership(identity, addr);
+    // Linkage first, signature only as a degraded fallback.
+    //
+    // A signature proves the caller controls the wallet - not that the wallet
+    // belongs to this Privy account. Checking the proof first therefore let any
+    // wallet that could sign register as a merchant under whoever happened to be
+    // logged in, silently bypassing the ownership check that had just refused
+    // it. Ask Privy first, and accept a signature only when Privy itself could
+    // not answer.
+    let walletOwnership: PrivyWalletOwnership;
+    try {
+      walletOwnership = await assertPrivyWalletOwnership(identity, addr);
+    } catch (ownershipError) {
+      const lookupUnavailable = ownershipError instanceof PrivyAuthError
+        && (ownershipError.code === "PRIVY_USER_LOOKUP_FAILED" || ownershipError.code === "PRIVY_CONFIG_MISSING");
+      const proofOwnership = lookupUnavailable
+        ? await verifyRegistrationWalletProof(identity, addr, walletProof)
+        : null;
+      if (!proofOwnership) throw ownershipError;
+      walletOwnership = proofOwnership;
+    }
     await upsertUser({
       openId: identity.userId,
       name,
@@ -948,6 +966,25 @@ function getPermitDeadline(permit: unknown): string | number | null {
   return typeof deadline === "string" || typeof deadline === "number" ? deadline : null;
 }
 
+/**
+ * The spender named inside the permit the PAYER is asked to sign.
+ *
+ * getPermitApproval below only reports a spender on the non-EIP-2612 fallback
+ * branch, so on the ordinary permit path nothing was checking who the customer
+ * authorises. They sign quote.permit.eip712 blind in their wallet, so the
+ * spender inside it has to be held against the live SOR contract too.
+ *
+ * Returns null when the payload names no spender we recognise — callers must
+ * treat that as "nothing to check", never as approval.
+ */
+function getPermitSpender(permit: unknown): string | null {
+  const typedData = getPermitTypedData(permit) as Record<string, unknown> | null;
+  const message = typedData?.message as Record<string, unknown> | undefined;
+  const details = message?.details as Record<string, unknown> | undefined;
+  const spender = message?.spender ?? details?.spender;
+  return typeof spender === "string" && /^0x[0-9a-fA-F]{40}$/.test(spender) ? spender : null;
+}
+
 function getPermitApproval(permit: unknown, fallbackAmountRaw: string): { spender: string; amountRaw: string } | null {
   if (!permit || typeof permit !== "object") return null;
   const value = permit as Record<string, unknown>;
@@ -1250,7 +1287,13 @@ async function reconcileSeraSwapTransaction(tx: Transaction): Promise<Transactio
   const txHash = order.settlement_summary?.latest_tx_hash;
   const nextNotes = JSON.stringify({ ...notes, seraStatus, seraOrder: order });
 
-  if (seraStatus === "failed" || seraStatus === "cancelled") {
+  // Sera is explicit that error_code is the field to branch on and `error` is
+  // display-only. TRANSIENT_SETTLEMENT_FAILURE is documented as retryable
+  // infrastructure noise, so treating it as terminal would abandon a swap that
+  // is still going to settle - and the payer has already parted with funds.
+  const seraErrorCode = String(order.error_code || "").toUpperCase();
+  const retryableFailure = seraErrorCode === "TRANSIENT_SETTLEMENT_FAILURE";
+  if ((seraStatus === "failed" || seraStatus === "cancelled") && !retryableFailure) {
     const reason = order.error || order.settlement_summary?.latest_failed_fill_failure_reason || order.error_code || `Sera swap ${seraStatus}`;
     await updateTransaction(tx.id, { notes: nextNotes });
     await failTransactionRecord({ ...tx, notes: nextNotes }, reason);
@@ -1505,10 +1548,26 @@ paymentRouter.post("/payment/swap/quote", async (req, res) => {
       }));
     let quote = await requestQuote();
     let routeParams = getRouteParams(quote);
+    // Sera answers HTTP 200 with minOutputAmount "0" when no executable route
+    // exists at this size. Those quotes are informational only and POST /swap
+    // rejects them, so refuse here rather than persisting a transaction the
+    // payer can never settle. This has to sit OUTSIDE the requestedReceiveAmount
+    // branch below: receiveAmount is optional on this route, and a zero-output
+    // quote is equally unusable with or without it.
+    const assertExecutableRoute = () => {
+      if (BigInt(String(routeParams.minOutputAmount)) <= 0n) {
+        throw new SeraApiError(
+          409,
+          `Sera has no executable route for ${fromToken.symbol}/${toToken.symbol} at this amount`,
+          undefined,
+          "no_liquidity",
+        );
+      }
+    };
+    assertExecutableRoute();
     if (requestedReceiveAmount) {
       const requestedOutputRaw = BigInt(toRawTokenAmount(requestedReceiveAmount, toToken.decimals));
       const quotedOutputRaw = BigInt(String(routeParams.minOutputAmount));
-      if (quotedOutputRaw <= 0n) throw new Error("Sera quote returned no output");
       if (quotedOutputRaw < requestedOutputRaw) {
         const currentInputRaw = BigInt(quoteRequest.from_amount);
         // Round up proportionally, then add a small buffer for quote refresh
@@ -1517,12 +1576,20 @@ paymentRouter.post("/payment/swap/quote", async (req, res) => {
         quoteRequest.from_amount = adjustedInputRaw.toString();
         quote = await requestQuote();
         routeParams = getRouteParams(quote);
+        assertExecutableRoute();
         if (BigInt(String(routeParams.minOutputAmount)) < requestedOutputRaw) {
           throw new Error("Sera quote cannot currently cover the merchant receive amount");
         }
       }
     }
-    const quoteUuid = quote.uuid ?? routeParams.uuid;
+    // quote.uuid is the quote record id POST /swap resolves; routeParams.uuid is
+    // the composite uint256 bound into the signed intent. They are different
+    // values, so falling back from one to the other submits an id Sera cannot
+    // resolve — and does it silently, at settlement time. Fail here instead.
+    const quoteUuid = typeof quote.uuid === "string" || typeof quote.uuid === "number"
+      ? String(quote.uuid)
+      : "";
+    if (!quoteUuid) throw new Error("Sera quote did not return a quote id");
     // SeraSOR's IntentMatched event emits the EIP-712 struct hash (before the
     // domain separator), so persist exactly that value for public on-chain
     // settlement reconciliation.
@@ -1532,6 +1599,13 @@ paymentRouter.post("/payment/swap/quote", async (req, res) => {
     const approval = getPermitApproval(quote.permit, routeParams.maxInputAmount);
     if (approval && (!config.sor_address || approval.spender.toLowerCase() !== config.sor_address.toLowerCase())) {
       throw new Error("Sera quote approval target does not match the live SOR contract");
+    }
+    // Same guarantee for the ordinary EIP-2612 path, which the check above
+    // never reached: whoever the payer is about to approve for maxInputAmount
+    // must be the SOR contract Sera itself reports.
+    const permitSpender = getPermitSpender(quote.permit);
+    if (permitSpender && (!config.sor_address || permitSpender.toLowerCase() !== config.sor_address.toLowerCase())) {
+      throw new Error("Sera quote permit spender does not match the live SOR contract");
     }
     const requestedTxId = typeof req.body.txId === "string" ? req.body.txId.trim() : "";
     const txId = requestedTxId || uuidv4();
@@ -3049,7 +3123,7 @@ paymentRouter.get("/healthz", (_req, res) => res.json({ status: "ok", ts: Date.n
 const GOLDSKY_URL = ENV.goldskyGraphqlUrl;
 
 // Simple in-memory rate cache: { [pair]: { rate, ts } }
-const rateCache = new Map<string, { rate: number; ts: number }>();
+const rateCache = new Map<string, { rate: number; ts: number; asOf?: number }>();
 const CACHE_TTL_MS = 60_000; // 1 minute
 
 /**
@@ -3197,7 +3271,13 @@ class SeraRateUnavailableError extends Error {
  * the failure only at the route would leave the other paths free to keep
  * hammering Sera and re-trip the limit for everyone.
  */
-async function fetchSeraRestFxRate(from: string, to: string, chainId?: number): Promise<{ rate: number; source: string }> {
+/**
+ * `source` says WHERE a rate came from, and `asOf` how old the underlying
+ * quote is. Both matter: only "sera-fx-rate" is a true reference FX rate, and
+ * Sera returns HTTP 200 on that feed even when its provider data has coverage
+ * gaps, so the timestamp is the only staleness signal there is.
+ */
+async function fetchSeraRestFxRate(from: string, to: string, chainId?: number): Promise<{ rate: number; source: string; asOf?: number }> {
   const scope = chainId === SERA_TESTNET_CHAIN_ID ? "test" : "live";
   const failureKey = `sera-quote:${scope}:${from}:${to}`;
   try {
@@ -3213,7 +3293,7 @@ async function fetchSeraRestFxRate(from: string, to: string, chainId?: number): 
   }
 }
 
-async function fetchSeraRestFxRateUncached(from: string, to: string, chainId?: number): Promise<{ rate: number; source: string }> {
+async function fetchSeraRestFxRateUncached(from: string, to: string, chainId?: number): Promise<{ rate: number; source: string; asOf?: number }> {
   if (chainId !== undefined && chainId !== SERA_MAINNET_CHAIN_ID && chainId !== SERA_TESTNET_CHAIN_ID) {
     throw new Error(`Sera payments are not supported on chain ${chainId}`);
   }
@@ -3226,7 +3306,7 @@ async function fetchSeraRestFxRateUncached(from: string, to: string, chainId?: n
   const cacheKey = `sera-quote:${cacheScope}:${from}:${to}`;
   const cached = rateCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
-    return { rate: cached.rate, source: "cache" };
+    return { rate: cached.rate, source: "cache", asOf: cached.asOf };
   }
   // Answer a recently-failed pair from memory rather than asking Sera again.
   replayRateFailure(cacheKey);
@@ -3256,7 +3336,10 @@ async function fetchSeraRestFxRateUncached(from: string, to: string, chainId?: n
   // below overwrite lastRateError, which would otherwise mask a Sera /fx/rate
   // outage and mislabel it as "no liquidity".
   let fxFeedError: unknown = null;
-  if (/^[A-Z]{3}$/.test(fromCurrency) && /^[A-Z]{3}$/.test(toCurrency)) {
+  // Sera documents these as alphabetic currency codes, not strictly three
+  // letters. The old {3} test SILENTLY skipped the reference feed for anything
+  // else and dropped straight to the fallbacks, with no error to explain why.
+  if (/^[A-Z]+$/.test(fromCurrency) && /^[A-Z]+$/.test(toCurrency)) {
     try {
       const fx = await callSeraApi<SeraFxRateResponse>({
         baseUrl,
@@ -3269,8 +3352,13 @@ async function fetchSeraRestFxRateUncached(from: string, to: string, chainId?: n
       if (!Number.isFinite(rate) || rate <= 0) {
         throw new Error(`Invalid Sera FX rate for ${fromCurrency}/${toCurrency}`);
       }
-      rateCache.set(cacheKey, { rate, ts: Date.now() });
-      return { rate, source: "sera-fx-rate" };
+      // Sera documents as_of as "unix timestamp of newest provider quote in
+      // cluster" and returns 200 even with coverage gaps, so this is the only
+      // way a caller can tell a fresh price from an old one.
+      const asOf = Number((fx as { as_of?: unknown }).as_of);
+      const freshness = Number.isFinite(asOf) && asOf > 0 ? asOf : undefined;
+      rateCache.set(cacheKey, { rate, ts: Date.now(), asOf: freshness });
+      return { rate, source: "sera-fx-rate", asOf: freshness };
     } catch (error) {
       lastRateError = error;
       fxFeedError = error;
@@ -3347,29 +3435,61 @@ async function fetchSeraRestFxRateUncached(from: string, to: string, chainId?: n
   };
 
   let lastQuoteError: unknown = null;
-  try {
-    const rate = await quoteRate(
+
+  /*
+    Quote BOTH orientations and take the geometric mean.
+
+    A Sera quote reports only `minOutputAmount` - the slippage-protected floor,
+    not a mid-market price - so any single quote is off by that buffer, and which
+    way it errs depends on which direction was quoted. Quoting to->from and
+    inverting overstates the rate by the buffer; quoting from->to understates it
+    by the same buffer. sqrt(a * b) lands back on mid.
+
+    Measured on XSGD/MYRT: the two orientations give 3.19180864 and 3.16349578,
+    whose product is 0.99113 of unity - a ~0.44% buffer per hop - and whose
+    geometric mean, 3.177606, is the mid-market rate. Taking one orientation
+    alone would misprice every payment by that much, in a direction decided by
+    nothing more meaningful than which side happened to have liquidity.
+
+    This only runs when GET /fx/rate is unavailable; that feed already reports a
+    true reference rate and is preferred above.
+  */
+  const [inverseResult, directResult] = await Promise.allSettled([
+    quoteRate(
       toToken,
       fromToken,
       (inputAmountInTo, outputAmountInFrom) => inputAmountInTo / outputAmountInFrom,
-    );
-    rateCache.set(cacheKey, { rate, ts: Date.now() });
-    return { rate, source: "sera-quote-rate" };
-  } catch (error) {
-    lastQuoteError = error;
-  }
-
-  try {
-    const rate = await quoteRate(
+    ),
+    quoteRate(
       fromToken,
       toToken,
-      (_inputAmountInFrom, outputAmountInTo) => outputAmountInTo / _inputAmountInFrom,
-    );
-    rateCache.set(cacheKey, { rate, ts: Date.now() });
-    return { rate, source: "sera-quote-rate-reverse" };
-  } catch (error) {
-    lastQuoteError = error;
+      (inputAmountInFrom, outputAmountInTo) => outputAmountInTo / inputAmountInFrom,
+    ),
+  ]);
+
+  const inverseRate = inverseResult.status === "fulfilled" ? inverseResult.value : null;
+  const directRate = directResult.status === "fulfilled" ? directResult.value : null;
+
+  if (inverseRate && directRate) {
+    const rate = Math.sqrt(inverseRate * directRate);
+    if (Number.isFinite(rate) && rate > 0) {
+      rateCache.set(cacheKey, { rate, ts: Date.now() });
+      return { rate, source: "sera-quote-mid" };
+    }
   }
+
+  // Only one side is quotable, so the buffer cannot be cancelled. A rate that is
+  // ~0.4% off still beats refusing the payment outright, but it is labelled
+  // differently so the difference is visible to anyone reading the response.
+  const singleSidedRate = inverseRate ?? directRate;
+  if (singleSidedRate) {
+    rateCache.set(cacheKey, { rate: singleSidedRate, ts: Date.now() });
+    return { rate: singleSidedRate, source: inverseRate ? "sera-quote-inverse" : "sera-quote-direct" };
+  }
+
+  lastQuoteError = inverseResult.status === "rejected"
+    ? inverseResult.reason
+    : (directResult as PromiseRejectedResult).reason;
 
   // Every source failed. Say WHICH one and why rather than emitting a generic
   // "unable to fetch rate" — the two causes need completely different actions.
@@ -3410,16 +3530,21 @@ paymentRouter.get("/rates", async (req, res) => {
 
     const requestedChainId = Number(req.query.chainId ?? req.query.chain_id ?? 1);
     const chainId = Number.isInteger(requestedChainId) && requestedChainId > 0 ? requestedChainId : 1;
-    const { rate, source } = await fetchSeraRestFxRate(from, to, chainId);
+    const { rate, source, asOf } = await fetchSeraRestFxRate(from, to, chainId);
     /*
     // Apply SeraPay's 0.5% silent spread — customer pays slightly more than the raw Sera rate.
     // The merchant receives exactly what they requested; SeraPay keeps the difference.
     const SERA_MARKUP = 1.005;
     const rate = rawRate * SERA_MARKUP;
     */
-    // Cache exchange rates for 10 seconds — matches server-side TTL
+    // Deliberately shorter than the 60s in-process TTL above: a shared cache
+    // hands the same response to every merchant, so it errs on the fresh side.
     res.setHeader("Cache-Control", "public, max-age=10, stale-while-revalidate=30");
-    res.json({ from, to, rate, source });
+    // `source` distinguishes a true reference rate ("sera-fx-rate") from one
+    // derived from a swap quote, which carries that route's slippage buffer.
+    // `asOf` is present only for the reference feed, which is the only source
+    // that publishes its own freshness.
+    res.json({ from, to, rate, source, ...(asOf ? { asOf } : {}) });
   } catch (e: any) {
     if (typeof e?.message === "string" && e.message.startsWith("Unsupported Sera token:")) {
       res.status(400).json({ error: e.message });

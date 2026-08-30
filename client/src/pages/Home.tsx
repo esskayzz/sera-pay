@@ -5,14 +5,14 @@ import { useLocation } from "wouter";
 import { useChainId } from "wagmi";
 import { type Stablecoin } from "@/lib/stablecoins";
 import { buildPaymentQrValue, buildPaymentUrl, LIVE_PAYMENT_CHAIN_ID, resolvePaymentChainId, seraRateErrorMessage } from "@/lib/payment";
-import { loadSeraCurrencies, type SeraCurrency } from "@/lib/currencyCalculator";
+import { applyConversionMinimum, conversionMinimumMessage, getConversionMinimum, isBelowConversionMinimum, loadSeraCurrencies, type SeraCurrency } from "@/lib/currencyCalculator";
 import { buildClientAppUrl, getClientAppPath } from "@/lib/app-url";
 import { QRStyled, QR_STYLES, type QrMode, type QrStyle } from "@/components/QRStyled";
 import { useMerchantProfile } from "@/hooks/use-merchant";
 import { useAuth } from "@/hooks/use-auth";
 import { useSeraApiConfig } from "@/hooks/use-gateway";
 import { useQueryClient } from "@tanstack/react-query";
-import { ArrowRight, ArrowUpDown, ChevronDown, Copy, Download, QrCode, Wallet } from "lucide-react";
+import { ArrowRight, ArrowUpDown, ChevronDown, Copy, Download, Globe, QrCode, Wallet } from "lucide-react";
 import { SeoFooter } from "./SeoPages";
 import { SeraLogo, SeraPayHeader } from "@/components/SeraPayHeader";
 import { NetworkModeButton, NetworkSwitcherModal } from "@/components/NetworkSwitcher";
@@ -254,6 +254,10 @@ function CoinSheet({
   coins: Stablecoin[];
 }) {
   const [query, setQuery] = useState("");
+  // "Any coin" is the same state as Clear — the merchant names no pay token and
+  // the customer chooses on the Pay Now page. It only belongs on sheets that
+  // allow that, and it is hidden while searching since it matches no symbol.
+  const showAnyCoin = Boolean(onClear) && !query.trim();
   const filtered = query
     ? coins.filter(c =>
         c.symbol.toLowerCase().includes(query.toLowerCase()) ||
@@ -332,11 +336,34 @@ function CoinSheet({
         <div className="serapay-modal-scrollbar" style={{ flex: 1, overflowY: "auto", paddingBottom: 16 }}>
           <div style={{ margin: "0 12px" }}>
             <div style={{ background: "#F9F9FB", borderRadius: 14, overflow: "hidden" }}>
+              {showAnyCoin ? (
+                <button onClick={() => { onClear?.(); onClose(); }} style={{
+                  width: "100%", display: "flex", alignItems: "center", gap: 12,
+                  padding: "12px 14px", background: "none", border: "none", cursor: "pointer",
+                  transition: "background 0.12s",
+                }}>
+                  <div style={{
+                    width: 34, height: 34, borderRadius: "50%", flexShrink: 0,
+                    background: "rgba(0,209,160,0.10)", color: "#00A87A",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                  }}>
+                    <Globe size={19} strokeWidth={2.1} />
+                  </div>
+                  <div style={{ flex: 1, textAlign: "left" }}>
+                    <div style={{ fontSize: 14, fontWeight: 600, color: "#1C1C1E" }}>Any coin</div>
+                  </div>
+                  {!selectedSymbol && (
+                    <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="#00D1A0" strokeWidth={2.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                    </svg>
+                  )}
+                </button>
+              ) : null}
               {filtered.map((c, i) => (
                 <button key={c.symbol} onClick={() => { onSelect(c); onClose(); }} style={{
                   width: "100%", display: "flex", alignItems: "center", gap: 12,
                   padding: "12px 14px", background: "none", border: "none", cursor: "pointer",
-                  borderTop: i > 0 ? "1px solid rgba(60,60,67,0.06)" : "none",
+                  borderTop: i > 0 || showAnyCoin ? "1px solid rgba(60,60,67,0.06)" : "none",
                   transition: "background 0.12s",
                 }}>
                   <TokenIcon symbol={c.symbol} logoUri={c.logoUri} size={34} />
@@ -1813,10 +1840,43 @@ export default function Home() {
   const qrDisplayAmount = normalizeDecimalAmountText(customerAmount || amount);
   const conversionReady = !customerCoin || customerCoin.symbol === selectedCoin?.symbol || Boolean(exchangeRate && customerAmount && !conversionError);
 
-  // No minimum is enforced here. Sera's per-token floor applies to its TRADE
-  // engine, and a SeraPay QR is a plain ERC-20 transfer that never touches
-  // Sera's contracts — payments below the figure were confirmed to go through
-  // fine, so warning about it only blocked merchants from amounts that work.
+  /**
+   * "Customer Pays" is the field that turns a payment request into a conversion.
+   *
+   * Left empty, the merchant has only named the currency they want to receive
+   * and the customer chooses how to pay on the Pay Now page. Nothing is being
+   * converted, so no rate, no Sera floor and no swap has anything to act on.
+   *
+   * Filled in, the merchant has named the exact token the customer must send —
+   * the only thing an EIP-681 wallet request can express, and the only case
+   * where a conversion exists to quote, floor, or settle.
+   */
+  const isConversionMode = Boolean(customerCoin);
+
+  // Sera's floor sits on the token the customer SENDS: that is the input of
+  // the trade, and the same token the server checks before requesting a swap
+  // quote. A direct transfer never reaches Sera's contracts and has no floor
+  // at all, so this is read in conversion mode only.
+  const conversionMinimum = isConversionMode ? getConversionMinimum(customerCoin) : null;
+  const belowConversionMinimum = isBelowConversionMinimum(customerAmount, conversionMinimum);
+  const canGenerateQr = Boolean(selectedCoin) && !currenciesLoading && !currenciesError && !rateLoading && conversionReady && !belowConversionMinimum;
+
+  /**
+   * Settles a typed amount onto Sera's floor once the merchant leaves the field.
+   *
+   * Lifting per keystroke would make the field impossible to type into — "2"
+   * would jump to the minimum before "2000" could be finished — so the message
+   * shows while typing and the numbers move on blur. Both sides move together,
+   * because the receive figure is only meaningful as the rate-converted twin of
+   * the pay figure.
+   */
+  const settleConversionMinimum = useCallback(() => {
+    const lifted = applyConversionMinimum(customerAmount, exchangeRate, getConversionMinimum(customerCoin));
+    if (!lifted) return;
+    setCustomerAmount(lifted.payAmount);
+    setAmount(lifted.receiveAmount);
+  }, [customerAmount, customerCoin, exchangeRate]);
+
   const isConnected = authenticated;
   const merchantWorkspaceReady = Boolean(dashboardApiKey && walletAddress);
 
@@ -1913,13 +1973,27 @@ export default function Home() {
         if (data.rate) {
           setExchangeRate(data.rate);
           // Recalculate the dependent field
+          let nextReceive = amount;
+          let nextPay = customerAmount;
           if (lastEdited === "receive" && amount) {
             const calc = (parseFloat(amount) * data.rate);
-            setCustomerAmount(isNaN(calc) ? "" : formatDecimalAmount(calc));
+            nextPay = isNaN(calc) ? "" : formatDecimalAmount(calc);
           } else if (lastEdited === "pay" && customerAmount) {
             const calc = (parseFloat(customerAmount) / data.rate);
-            setAmount(isNaN(calc) ? "" : formatDecimalAmount(calc));
+            nextReceive = isNaN(calc) ? "" : formatDecimalAmount(calc);
           }
+          // Sera refuses to convert below its per-token floor, so the figure
+          // the merchant asked for may not be executable on this route. Lift
+          // the customer's side to the floor and re-price the merchant's side
+          // from the same rate — a raised payment settles into a larger
+          // receipt, and saying otherwise would understate the settlement.
+          const lifted = applyConversionMinimum(nextPay, data.rate, getConversionMinimum(customerCoin));
+          if (lifted) {
+            nextPay = lifted.payAmount;
+            nextReceive = lifted.receiveAmount;
+          }
+          setCustomerAmount(nextPay);
+          setAmount(nextReceive);
         } else {
           throw new Error("Sera did not return an exchange rate");
         }
@@ -1927,6 +2001,10 @@ export default function Home() {
       .catch(e => {
         if (e.name !== "AbortError") {
           setExchangeRate(null);
+          // Drop the figure this rate produced. It was computed for the
+          // PREVIOUS pay coin, and leaving it in place re-labels it with the
+          // new one — 0.317762 MYRT silently becomes "0.317762 IDRT".
+          if (lastEdited === "pay") setAmount(""); else setCustomerAmount("");
           setConversionError(seraRateErrorMessage(e));
         }
       })
@@ -2043,6 +2121,9 @@ export default function Home() {
       setConversionError("A current Sera exchange rate is required before generating this payment");
       return;
     }
+    // Sera would reject this conversion at the counter. Refusing here keeps the
+    // merchant from printing a QR that cannot be paid.
+    if (isBelowConversionMinimum(customerAmount, getConversionMinimum(customerCoin))) return;
     if (!receiverAddress) {
       setShowGuestReceiverModal(true);
       return;
@@ -2078,22 +2159,27 @@ export default function Home() {
     try {
       const displayCoin = customerCoin ?? selectedCoin;
       const displayAmount = customerAmount || amount;
-      const walletQrValue = buildPaymentQrValue({
-        receiverAddress,
-        coin: displayCoin?.symbol,
-        receiveCoin: selectedCoin?.symbol,
-        amount: displayAmount || undefined,
-        chainId: paymentChainId,
-        tokenAddress: currencies.find((coin) => coin.symbol === displayCoin?.symbol)?.contractAddress,
-        tokenDecimals: currencies.find((coin) => coin.symbol === displayCoin?.symbol)?.decimals,
-        paymentUrl,
-      });
+      // The card has to carry whatever the screen is showing. A receive-only
+      // request is answered on the Pay Now page, so its card holds that link;
+      // a named pay token is a wallet request, so its card holds the URI.
+      const cardQrValue = isConversionMode
+        ? buildPaymentQrValue({
+            receiverAddress,
+            coin: displayCoin?.symbol,
+            receiveCoin: selectedCoin?.symbol,
+            amount: displayAmount || undefined,
+            chainId: paymentChainId,
+            tokenAddress: currencies.find((coin) => coin.symbol === displayCoin?.symbol)?.contractAddress,
+            tokenDecimals: currencies.find((coin) => coin.symbol === displayCoin?.symbol)?.decimals,
+            paymentUrl,
+          })
+        : paymentUrl;
       // A downloaded card gets printed and left on a counter. Shipping the http
-      // fallback into one would strand a non-payable QR in the physical world
-      // long after the session that produced it.
-      if (!walletQrValue) return;
+      // fallback into a scan-and-pay card would strand a non-payable QR in the
+      // physical world long after the session that produced it.
+      if (!cardQrValue) return;
       await downloadPaymentQrCard({
-        qrValue: walletQrValue,
+        qrValue: cardQrValue,
         receiverAddress,
         amount: displayAmount,
         coin: displayCoin?.symbol,
@@ -2109,10 +2195,11 @@ export default function Home() {
     } finally {
       setQrDownloading(false);
     }
-  }, [amount, currencies, customerAmount, customerCoin, localLogoData, localQrBgColor, localQrFgColor, localQrMode, localQrStyle, merchantName, merchantProfile, paymentChainId, paymentUrl, receiverAddress, selectedCoin]);
+  }, [amount, currencies, customerAmount, customerCoin, isConversionMode, localLogoData, localQrBgColor, localQrFgColor, localQrMode, localQrStyle, merchantName, merchantProfile, paymentChainId, paymentUrl, receiverAddress, selectedCoin]);
 
   const handleReset = useCallback(() => {
     setStep(1);
+    setQrEditAmount("");
     setPaymentUrl("");
     setCopied(false);
     setDirectQrPayment(null);
@@ -2323,37 +2410,80 @@ export default function Home() {
     // Determine display values: show what customer pays
     const displayCoin = customerCoin ?? selectedCoin;
     const displayAmount = customerAmount || amount;
-    const activeQrValue = buildPaymentQrValue({
-      receiverAddress,
-      coin: displayCoin?.symbol,
-      receiveCoin: selectedCoin?.symbol,
-      amount: displayAmount || undefined,
-      chainId: paymentChainId,
-      tokenAddress: qrDisplayToken?.contractAddress,
-      tokenDecimals: qrDisplayToken?.decimals,
-      paymentUrl,
-    });
+    /*
+      A QR is either a wallet request or a web link. It cannot be both.
+
+      With no "Customer Pays" token the merchant has not said which token to
+      send, and EIP-681 has no way to express "any supported coin" — naming one
+      anyway would force a currency the customer never agreed to. So the code
+      carries the Pay Now URL: scanning opens the hosted checkout, where the
+      customer signs in and picks what they hold. That holds whether or not an
+      amount was set; an open-amount request is answered on the same page.
+
+      Once a pay token IS named there is exactly one transfer to encode, and the
+      wallet URI is what makes scan-and-pay work in OKX or MetaMask.
+    */
+    const activeQrValue = isConversionMode
+      ? buildPaymentQrValue({
+          receiverAddress,
+          coin: displayCoin?.symbol,
+          receiveCoin: selectedCoin?.symbol,
+          amount: displayAmount || undefined,
+          chainId: paymentChainId,
+          tokenAddress: qrDisplayToken?.contractAddress,
+          tokenDecimals: qrDisplayToken?.decimals,
+          paymentUrl,
+        })
+      : paymentUrl;
+    // An amount-less receive request has no figure to put above the code, and a
+    // bare token with nothing beside it reads as a price of zero.
+    const qrAmountHeaderVisible = isConversionMode || Boolean(displayAmount);
     const activeQrRenderMode = localQrMode || (merchantProfile?.qrMode as QrMode) || "standard";
     const activeQrLogo = localLogoData || merchantProfile?.logoData || undefined;
     const activeQrFgColor = normalizeQrColor(localQrFgColor || merchantProfile?.qrFgColor, "#000000");
     const activeQrBgColor = normalizeQrColor(localQrBgColor || merchantProfile?.qrBgColor, "#ffffff");
 
+    // What Done would set the customer's side to, so the floor can be named
+    // before it is applied rather than after.
+    const qrEditMinimum = getConversionMinimum(customerCoin);
+    const qrEditPayPreview = exchangeRate && customerCoin && qrEditAmount && selectedCoin?.symbol !== customerCoin.symbol
+      ? formatDecimalAmount(parseFloat(qrEditAmount) * exchangeRate)
+      : qrEditAmount;
+
+    // The draft amount must not outlive the modal: the receive-coin picker
+    // reads `qrEditAmount || amount`, so a leftover draft would silently price
+    // a later QR off a figure the merchant abandoned.
+    const closeQrEdit = () => {
+      setQrEditAmount("");
+      setQrEditMode(false);
+    };
+
     const handleQrEditSave = () => {
-      if (!qrEditAmount || isNaN(parseFloat(qrEditAmount))) { setQrEditMode(false); return; }
+      if (!qrEditAmount || isNaN(parseFloat(qrEditAmount))) { closeQrEdit(); return; }
       const safeAmount = normalizeDecimalAmountText(qrEditAmount);
-      if (!safeAmount) { setQrEditMode(false); return; }
-      setAmount(safeAmount);
+      if (!safeAmount) { closeQrEdit(); return; }
       // Recalculate customer amount
+      let nextReceiveAmount = safeAmount;
       let nextPayAmount = customerCoin?.symbol === selectedCoin?.symbol ? safeAmount : normalizeDecimalAmountText(customerAmount);
       if (exchangeRate && customerCoin && selectedCoin?.symbol !== customerCoin?.symbol) {
         const calc = parseFloat(safeAmount) * exchangeRate;
         nextPayAmount = isNaN(calc) ? "" : formatDecimalAmount(calc);
-        setCustomerAmount(nextPayAmount);
       }
+      // The merchant edits what they receive; the customer's side is derived,
+      // so if the derivation lands under Sera's floor it is the derivation that
+      // moves — and the receive figure moves with it to stay its rate-converted
+      // twin. In receive-only mode there is no derivation and no floor.
+      const lifted = applyConversionMinimum(nextPayAmount, exchangeRate, getConversionMinimum(customerCoin));
+      if (lifted) {
+        nextPayAmount = lifted.payAmount;
+        nextReceiveAmount = lifted.receiveAmount;
+      }
+      setAmount(nextReceiveAmount);
+      if (customerCoin) setCustomerAmount(nextPayAmount);
       // Rebuild payment URL
-      const newUrl = createPaymentUrl({ receiveAmount: safeAmount, payAmount: nextPayAmount });
+      const newUrl = createPaymentUrl({ receiveAmount: nextReceiveAmount, payAmount: nextPayAmount });
       setPaymentUrl(newUrl);
-      setQrEditMode(false);
+      closeQrEdit();
     };
 
     const handleQrCoinSelect = (coin: Stablecoin) => {
@@ -2385,11 +2515,20 @@ export default function Home() {
           if (requestId !== qrRateRequestRef.current) return;
           if (data.rate) {
             const calc = parseFloat(amount) * data.rate;
-            const newPayAmount = isNaN(calc) ? "" : formatDecimalAmount(calc);
+            let newPayAmount = isNaN(calc) ? "" : formatDecimalAmount(calc);
+            let newReceiveAmount = normalizeDecimalAmountText(amount);
+            // Each pay token carries its own floor, so a route that was fine a
+            // moment ago may not convert this amount at all.
+            const lifted = applyConversionMinimum(newPayAmount, data.rate, getConversionMinimum(coin));
+            if (lifted) {
+              newPayAmount = lifted.payAmount;
+              newReceiveAmount = lifted.receiveAmount;
+              setAmount(newReceiveAmount);
+            }
             setCustomerCoin(coin);
             setExchangeRate(data.rate);
             setCustomerAmount(newPayAmount);
-            const newUrl = createPaymentUrl({ payCoin: coin, payAmount: newPayAmount });
+            const newUrl = createPaymentUrl({ receiveAmount: newReceiveAmount, payCoin: coin, payAmount: newPayAmount });
             setPaymentUrl(newUrl);
           } else {
             throw new Error("Sera did not return an exchange rate");
@@ -2449,8 +2588,10 @@ export default function Home() {
             overflow: "visible",
           }}>
             {/* Customer pays label */}
+            {qrAmountHeaderVisible ? (
+            <>
             <p style={{ fontSize: 12, fontWeight: 600, color: "rgba(60,60,67,0.4)", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>
-              Customer Pays
+              {isConversionMode ? "Customer Pays" : "I Receive"}
             </p>
             {qrRateLoading ? (
               <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 44, gap: 8 }}>
@@ -2464,8 +2605,8 @@ export default function Home() {
                 </span>
                 <button
                   type="button"
-                  onClick={() => setShowQrCoinSheet(true)}
-                  aria-label="Change customer pay currency"
+                  onClick={() => (isConversionMode ? setShowQrCoinSheet(true) : setShowQrReceiveCoinSheet(true))}
+                  aria-label={isConversionMode ? "Change customer pay currency" : "Change receive currency"}
                   style={{
                     border: "none",
                     background: "transparent",
@@ -2498,6 +2639,8 @@ export default function Home() {
                 </button>
               </div>
             )}
+            </>
+            ) : null}
             {/* Spacer — receiveLabel moved below QR */}
             {conversionError ? (
               <div
@@ -2521,32 +2664,6 @@ export default function Home() {
                 }}
               >
                 {conversionError}
-              </div>
-            ) : null}
-            {/*
-              No wallet carries these tokens in its list, so a scanned request
-              shows as "Unknown" no matter who pays or what they hold. Say so
-              here — plainly, and only for the currencies where it is certain —
-              rather than letting the merchant find out at the counter.
-            */}
-            {displayCoin?.walletRecognition === "unlisted" ? (
-              <div
-                style={{
-                  width: "min(380px, calc(100vw - 64px))",
-                  boxSizing: "border-box",
-                  margin: "2px auto 14px",
-                  border: "1px solid rgba(245,158,11,0.3)",
-                  borderRadius: 12,
-                  background: "#FFF8E6",
-                  color: "#9A5B00",
-                  padding: "10px 12px",
-                  fontSize: 12,
-                  fontWeight: 650,
-                  lineHeight: 1.45,
-                  textAlign: "center",
-                }}
-              >
-                Most wallets can't name {displayCoin.symbol} yet, so it may show as “Unknown”. The amount and address are still correct.
               </div>
             ) : null}
             {/* QR Code */}
@@ -2622,7 +2739,33 @@ export default function Home() {
                 <Copy size={14} strokeWidth={2.2} />
               </button>
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 14 }}>
+            <button
+              type="button"
+              onClick={() => { setQrEditAmount(amount); setQrEditMode(true); }}
+              className="serapay-action-secondary serapay-hover-green"
+              style={{
+                width: "100%",
+                minHeight: 40,
+                marginTop: 14,
+                borderRadius: 13,
+                border: "1px solid rgba(10,31,26,0.08)",
+                background: "#fff",
+                color: "#0A1F1A",
+                fontSize: 12,
+                fontWeight: 800,
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 6,
+              }}
+            >
+              <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+              </svg>
+              Edit Amount
+            </button>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8 }}>
               <button
                 type="button"
                 onClick={handleDownloadQR}
@@ -2700,7 +2843,7 @@ export default function Home() {
         {qrEditMode && (
           <>
             <div style={{ position: "fixed", inset: 0, zIndex: 40, background: "rgba(0,0,0,0.3)", backdropFilter: "blur(4px)" }}
-              onClick={() => setQrEditMode(false)} />
+              onClick={closeQrEdit} />
             <div style={{
               position: "fixed", zIndex: 50, background: "#fff",
               top: "50%", left: "50%", transform: "translate(-50%, -50%)",
@@ -2714,14 +2857,11 @@ export default function Home() {
                   inputMode="decimal"
                   value={qrEditAmount}
                   onChange={e => {
-                    const nextAmount = limitDecimalPlaces(e.target.value);
-                    setQrEditAmount(nextAmount);
-                    if (!nextAmount || isNaN(parseFloat(nextAmount))) return;
-                    const nextPayAmount = exchangeRate && customerCoin && selectedCoin?.symbol !== customerCoin?.symbol
-                      ? formatDecimalAmount(parseFloat(nextAmount) * exchangeRate)
-                      : nextAmount;
-                    const nextUrl = createPaymentUrl({ receiveAmount: nextAmount, payAmount: nextPayAmount });
-                    if (nextUrl) setPaymentUrl(nextUrl);
+                    // Only Done commits. Rebuilding the payment URL on every
+                    // keystroke meant Cancel left the abandoned amount behind -
+                    // and in receive-only mode the QR *is* that URL, so the code
+                    // on screen stopped matching the amount printed above it.
+                    setQrEditAmount(limitDecimalPlaces(e.target.value));
                   }}
                   placeholder="0.00"
                   autoFocus
@@ -2747,8 +2887,19 @@ export default function Home() {
                   Customer pays ≈ {(parseFloat(qrEditAmount) * exchangeRate).toLocaleString(undefined, { maximumFractionDigits: 2 })} {customerCoin.symbol}
                 </p>
               )}
+              {/*
+                Saving will lift both figures to the floor rather than reject
+                the edit — the merchant is editing what they receive, and the
+                customer's side is derived from it. Say so before Done moves
+                numbers the merchant did not type.
+              */}
+              {qrEditMinimum && isBelowConversionMinimum(qrEditPayPreview, qrEditMinimum) ? (
+                <p role="alert" style={{ fontSize: 12, fontWeight: 650, lineHeight: 1.45, color: "#B42318", margin: "0 0 16px" }}>
+                  {conversionMinimumMessage(qrEditMinimum)}
+                </p>
+              ) : null}
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-                <button onClick={() => setQrEditMode(false)} style={{
+                <button onClick={closeQrEdit} style={{
                   height: 50, borderRadius: 14, background: "#F2F2F7", border: "none",
                   fontSize: 15, fontWeight: 600, color: "rgba(60,60,67,0.6)", cursor: "pointer",
                 }}>Cancel</button>
@@ -2769,6 +2920,10 @@ export default function Home() {
             title="Customer Pays With"
             onClose={() => setShowQrCoinSheet(false)}
             onSelect={handleQrCoinSelect}
+            /* Without this there was no way back: once a pay token was chosen on
+               the QR screen the request was stuck in conversion mode, even
+               though handleClearCustomerCoin already knows how to undo it. */
+            onClear={handleClearCustomerCoin}
             selectedSymbol={displayCoin?.symbol}
             coins={currencies}
           />
@@ -2784,6 +2939,23 @@ export default function Home() {
               const requestId = ++qrRateRequestRef.current;
               const receiveAmount = normalizeDecimalAmountText(qrEditAmount || amount);
               setConversionError("");
+              /*
+                Receive-only: this picks WHICH currency the merchant wants, and
+                nothing else. There is no customer pay token, so there is no
+                conversion to re-quote, no floor to clear and no swap to
+                configure — asking Sera for a rate here would invent an exchange
+                the merchant never requested and, worse, writing the chosen coin
+                into payCoin would silently turn an open request into a demand
+                for one exact token. A swap is set up on the form before the QR
+                is generated, never by changing a currency after the fact.
+              */
+              if (!customerCoin) {
+                setQrRateLoading(false);
+                setSelectedCoin(coin);
+                const newUrl = createPaymentUrl({ receiveCoin: coin, receiveAmount, payCoin: null, payAmount: "" });
+                if (newUrl) setPaymentUrl(newUrl);
+                return;
+              }
               // As with the pay-coin picker, keep the last valid QR active
               // until Sera confirms this new receive route is executable.
               if (customerCoin && customerCoin.symbol !== coin.symbol) {
@@ -2930,6 +3102,7 @@ export default function Home() {
                     setCustomerAmount("");
                   }
                 }}
+                onBlur={settleConversionMinimum}
                 placeholder="0.00"
                 style={{
                   width: "100%", textAlign: "right", fontSize: 20, fontWeight: 600,
@@ -3031,6 +3204,7 @@ export default function Home() {
                       setAmount("");
                     }
                   }}
+                  onBlur={settleConversionMinimum}
                   placeholder="0.00"
                   style={{
                     width: "100%", textAlign: "right", fontSize: 20, fontWeight: 600,
@@ -3045,6 +3219,16 @@ export default function Home() {
             </div>
           </div>
         </div>
+
+        {/*
+          Sera will refuse this conversion outright, so say the figure while the
+          merchant is still standing in the field that has to change.
+        */}
+        {belowConversionMinimum && conversionMinimum ? (
+          <p role="alert" style={{ margin: "-14px 0 16px", paddingLeft: 4, fontSize: 12, fontWeight: 650, lineHeight: 1.45, color: "#B42318" }}>
+            {conversionMinimumMessage(conversionMinimum)}
+          </p>
+        ) : null}
 
         {/* Advanced Options */}
         <div style={{ marginBottom: 16 }}>
@@ -3125,17 +3309,17 @@ export default function Home() {
         {/* Generate QR button */}
         <button
           onClick={handleGenerateQR}
-          disabled={!selectedCoin || currenciesLoading || !!currenciesError || rateLoading || !conversionReady}
+          disabled={!canGenerateQr}
           className="serapay-action-primary serapay-shine-button"
           style={{
             width: "100%", height: 54, borderRadius: 16,
-            background: selectedCoin && !currenciesLoading && !currenciesError && !rateLoading && conversionReady
+            background: canGenerateQr
               ? "linear-gradient(135deg, #4ECE9A, #3AB882)"
               : "rgba(0,0,0,0.08)",
             border: "none",
-            color: selectedCoin && !currenciesLoading && !currenciesError && !rateLoading && conversionReady ? "#fff" : "rgba(60,60,67,0.3)",
-            fontSize: 16, fontWeight: 700, cursor: selectedCoin && !currenciesLoading && !currenciesError && !rateLoading && conversionReady ? "pointer" : "not-allowed",
-            boxShadow: selectedCoin && !currenciesLoading && !currenciesError && !rateLoading && conversionReady ? "0 4px 12px rgba(78,206,154,0.18)" : "none",
+            color: canGenerateQr ? "#fff" : "rgba(60,60,67,0.3)",
+            fontSize: 16, fontWeight: 700, cursor: canGenerateQr ? "pointer" : "not-allowed",
+            boxShadow: canGenerateQr ? "0 4px 12px rgba(78,206,154,0.18)" : "none",
             display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
             transition: "all 0.2s",
           }}

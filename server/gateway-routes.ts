@@ -357,13 +357,25 @@ gatewayRouter.get("/sera/fx-rate", async (req, res) => {
   try {
     const base = String(req.query.base ?? "").trim();
     const quote = String(req.query.quote ?? "").trim();
-    if (!/^[A-Za-z]{3}$/.test(base) || !/^[A-Za-z]{3}$/.test(quote)) {
-      res.status(400).json({ error: "base and quote must be ISO currency codes, e.g. SGD and MYR." });
+    // Sera documents these as alphabetic codes, not strictly three letters.
+    if (!/^[A-Za-z]+$/.test(base) || !/^[A-Za-z]+$/.test(quote)) {
+      res.status(400).json({ error: "base and quote must be alphabetic currency codes, e.g. SGD and MYR." });
       return;
     }
     const mode = querySeraMode(req.query);
     res.json(await getSeraFxRate(resolveSeraBaseUrl(mode), base, quote));
   } catch (error) {
+    // Sera's own 503 (no provider data for this pair) is a different problem
+    // from a malformed request, and flattening both into 502 sent callers
+    // looking in the wrong place. Pass the distinction through.
+    if (error instanceof SeraApiError && error.status >= 500) {
+      res.status(503).json({ error: "Sera FX rate service is temporarily unavailable for this pair.", errorCode: "sera_fx_unavailable" });
+      return;
+    }
+    if (error instanceof SeraApiError && error.status >= 400) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
     res.status(502).json({ error: "Unable to fetch Sera FX rate" });
   }
 });
@@ -373,8 +385,29 @@ gatewayRouter.post("/sera/swap/quote", requireApiKey as any, async (req: any, re
     const { baseUrl } = await getMerchantSeraCredential(req.merchant.id);
     const ownerAddress = String(req.body.owner_address ?? req.body.ownerAddress ?? "").trim();
     const recipient = String(req.body.recipient ?? "").trim();
-    const gasMode = req.body.gas_mode ?? req.body.gasMode ?? "receive_less";
-    const expiration = Number(req.body.expiration ?? Math.floor(Date.now() / 1000) + 900);
+    // Two documented values only. A typo used to be forwarded verbatim and came
+    // back as an untyped "Invalid request"; and the old "receive_less" default
+    // silently took Sera's execution cost out of the MERCHANT's proceeds, which
+    // is the wrong default for a payment gateway.
+    const requestedGasMode = String(req.body.gas_mode ?? req.body.gasMode ?? "pay_more");
+    if (requestedGasMode !== "pay_more" && requestedGasMode !== "receive_less") {
+      res.status(400).json({ error: "gas_mode must be pay_more or receive_less." });
+      return;
+    }
+    const gasMode = requestedGasMode;
+    // Sera directs clients to base expiration on ITS clock, not ours. Drift here
+    // surfaces much later, as INTENT_DEADLINE_EXPIRED at submit time.
+    const seraNow = await callSeraApi<{ timestamp?: number }>({
+      baseUrl,
+      path: "/system/time",
+      authMode: "none",
+      merchantId: req.merchant.id,
+    });
+    const seraNowSec = Number(seraNow.timestamp);
+    if (!Number.isInteger(seraNowSec) || seraNowSec <= 0) {
+      throw new Error("Sera /system/time did not return a valid timestamp");
+    }
+    const expiration = Number(req.body.expiration ?? seraNowSec + 900);
 
     const fromTokenInput = String(req.body.from_token ?? req.body.fromToken ?? req.body.fromSymbol ?? "").trim();
     const toTokenInput = String(req.body.to_token ?? req.body.toToken ?? req.body.toSymbol ?? "").trim();
@@ -427,7 +460,7 @@ gatewayRouter.get("/sera/orders", requireApiKey as any, async (req: any, res) =>
     const data = await callSeraApi({
       baseUrl,
       path: "/orders",
-      query: queryObject(req.query),
+      query: ownerScopedQuery(req.query, req.merchant.walletAddress),
       credential,
       authMode: "api_key",
       merchantId: req.merchant.id,
@@ -449,7 +482,7 @@ gatewayRouter.get("/sera/fills", requireApiKey as any, async (req: any, res) => 
     const data = await callSeraApi({
       baseUrl,
       path: "/fills",
-      query: queryObject(req.query),
+      query: ownerScopedQuery(req.query, req.merchant.walletAddress),
       credential,
       authMode: "api_key",
       merchantId: req.merchant.id,
@@ -471,7 +504,7 @@ gatewayRouter.get("/sera/balances", requireApiKey as any, async (req: any, res) 
     const data = await callSeraApi({
       baseUrl,
       path: "/balances",
-      query: queryObject(req.query),
+      query: ownerScopedQuery(req.query, req.merchant.walletAddress),
       credential,
       authMode: "api_key",
       merchantId: req.merchant.id,
@@ -546,6 +579,23 @@ async function getMerchantSeraCredential(merchantId: string) {
   const baseUrl = resolveSeraBaseUrl(mode, config?.seraApiBaseUrl);
   const credential = decryptSecret(config?.seraApiKeyEncrypted) || ENV.seraApiKey || "";
   return { config, baseUrl, credential };
+}
+
+/**
+ * Sera's owner-scoped reads reject a mismatched owner with 403 and an absent one
+ * with 422, and treat the address as case-sensitive. A merchant's credential can
+ * only ever read their own wallet, so fill it in rather than making them
+ * discover that through an error - and clamp `limit` to the documented ceiling
+ * of 500 instead of letting Sera reject the whole call.
+ */
+function ownerScopedQuery(query: any, merchantWallet: string | null | undefined) {
+  const base = queryObject(query);
+  const requestedOwner = String(base.owner_address ?? base.ownerAddress ?? merchantWallet ?? "").trim();
+  delete base.ownerAddress;
+  if (requestedOwner) base.owner_address = requestedOwner.toLowerCase();
+  const limit = Number(base.limit);
+  if (Number.isFinite(limit) && limit > 500) base.limit = "500";
+  return base;
 }
 
 function queryObject(query: any) {

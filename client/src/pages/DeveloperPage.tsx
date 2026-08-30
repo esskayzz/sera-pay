@@ -377,8 +377,20 @@ function SeraApiConfigCard() {
       };
 
       const owner = wallet.address;
-      const chainId = system.chainId ?? 11155111;
-      const verifyingContract = system.seraAddress ?? "0xd0fc92d8eF9bE26D7288fCa1D6458f675e72B83a";
+      // Never guess the signing domain. Falling back to Sepolia meant a mainnet
+      // merchant signing during a /config outage built the EIP-712 domain
+      // against the wrong chain and got an unexplained signature-mismatch 400.
+      // A key signed for the wrong domain is worthless, so stop and say so.
+      const chainId = system.chainId;
+      const verifyingContract = system.seraAddress;
+      if (!chainId || !verifyingContract) {
+        // Deliberately message-less: the catch below already shows this page's
+        // own "Unable to generate Sera API key" toast, and the reason belongs in
+        // the console, not on screen. Signing against a guessed chain would mint
+        // a key bound to the wrong EIP-712 domain, so refusing is the point.
+        if (import.meta.env.DEV) console.warn("[Sera] /config unavailable - refusing to build the signing domain from defaults");
+        throw new Error("");
+      }
       const timestamp = Math.floor(Date.now() / 1000);
       const typedData = {
         domain: {

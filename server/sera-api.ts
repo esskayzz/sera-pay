@@ -297,28 +297,25 @@ export async function getSeraSystemSnapshot(
     };
   }
 
-  try {
-    const [health, config] = await Promise.all([
-      callSeraApi<{ status?: string }>({ baseUrl: normalizedBaseUrl, path: "/health", merchantId }),
-      callSeraApi<{
-        chain_id?: number;
-        sera_address?: string | null;
-        vault_address?: string | null;
-        sor_address?: string | null;
-      }>({ baseUrl: normalizedBaseUrl, path: "/config", merchantId }),
-    ]);
+  // Settled, not all-or-nothing. Sera documents /health as returning 503 when a
+  // backing dependency is down, while /config "intentionally stays available
+  // even during partial startup". Failing them together threw away a perfectly
+  // good set of contract addresses and reported them as null - the exact
+  // behaviour the /config note tells clients not to adopt.
+  const [healthResult, configResult] = await Promise.allSettled([
+    callSeraApi<{ status?: string }>({ baseUrl: normalizedBaseUrl, path: "/health", merchantId }),
+    callSeraApi<{
+      chain_id?: number;
+      sera_address?: string | null;
+      vault_address?: string | null;
+      sor_address?: string | null;
+    }>({ baseUrl: normalizedBaseUrl, path: "/config", merchantId }),
+  ]);
 
-    return {
-      mode,
-      baseUrl: normalizedBaseUrl,
-      healthy: health.status === "healthy",
-      chainId: config.chain_id ?? null,
-      seraAddress: config.sera_address ?? null,
-      vaultAddress: config.vault_address ?? null,
-      sorAddress: config.sor_address ?? null,
-      message: health.status === "healthy" ? "Sera API is healthy." : `Sera API status: ${health.status ?? "unknown"}`,
-    };
-  } catch {
+  const health = healthResult.status === "fulfilled" ? healthResult.value : null;
+  const config = configResult.status === "fulfilled" ? configResult.value : null;
+
+  if (!health && !config) {
     return {
       mode,
       baseUrl: normalizedBaseUrl,
@@ -330,6 +327,21 @@ export async function getSeraSystemSnapshot(
       message: "Unable to reach Sera API",
     };
   }
+
+  return {
+    mode,
+    baseUrl: normalizedBaseUrl,
+    healthy: health?.status === "healthy",
+    chainId: config?.chain_id ?? null,
+    seraAddress: config?.sera_address ?? null,
+    vaultAddress: config?.vault_address ?? null,
+    sorAddress: config?.sor_address ?? null,
+    // Same wording as before in every case. Only the contract fields changed:
+    // they now survive a /health outage instead of being nulled out with it.
+    message: health?.status === "healthy"
+      ? "Sera API is healthy."
+      : `Sera API status: ${health?.status ?? "unknown"}`,
+  };
 }
 
 export async function verifySeraApiCredential(baseUrl: string, credential: string, merchantId?: string | null): Promise<{

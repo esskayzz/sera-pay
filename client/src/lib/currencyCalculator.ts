@@ -1,4 +1,5 @@
 import { getStablecoinBySymbol, getStablecoinLogoUrl, type Stablecoin } from "./stablecoins";
+import { formatDecimalAmount } from "./decimalInput";
 
 export type SeraCurrency = Stablecoin & {
   source: "sera" | "fallback";
@@ -137,6 +138,25 @@ function buildCurrency(token: SeraTokenPayload): SeraCurrency {
   };
 }
 
+/**
+ * Currencies merchants actually reach for, pinned above the long tail.
+ *
+ * Sera's registry carries 40 tokens across 22 currencies, most of which a given
+ * merchant will never touch. Sorting purely alphabetically (or by region) buried
+ * the everyday ones behind cNGN, ZARP and BRLV. Everything not listed here still
+ * appears, alphabetically, straight after.
+ */
+const COMMON_SYMBOLS = ["USDC", "USDT", "XSGD", "MYRT", "IDRT"];
+
+function compareCurrencies(a: SeraCurrency, b: SeraCurrency): number {
+  const aRank = COMMON_SYMBOLS.indexOf(a.symbol);
+  const bRank = COMMON_SYMBOLS.indexOf(b.symbol);
+  if (aRank !== -1 && bRank !== -1) return aRank - bRank;
+  if (aRank !== -1) return -1;
+  if (bRank !== -1) return 1;
+  return a.symbol.localeCompare(b.symbol);
+}
+
 export async function loadSeraCurrencies(chainId?: number): Promise<SeraCurrency[]> {
   const params = new URLSearchParams();
   if (chainId) params.set("chainId", String(chainId));
@@ -155,7 +175,7 @@ export async function loadSeraCurrencies(chainId?: number): Promise<SeraCurrency
     bySymbol.set(symbol, buildCurrency(token));
   }
   if (bySymbol.size === 0) throw new Error("Sera returned an empty token registry");
-  return Array.from(bySymbol.values()).sort((a, b) => a.region.localeCompare(b.region) || a.symbol.localeCompare(b.symbol));
+  return Array.from(bySymbol.values()).sort(compareCurrencies);
 }
 
 export async function getCurrencyRate(from: string, to: string, chainId?: number): Promise<RateResult> {
@@ -170,6 +190,68 @@ export async function getCurrencyRate(from: string, to: string, chainId?: number
     throw new Error(data.detail || data.error || `Unable to convert ${source} to ${target}`);
   }
   return { from: source, to: target, rate: Number(data.rate), source: String(data.source || "sera") };
+}
+
+export interface ConversionMinimum {
+  /** Smallest amount of this token Sera will accept as the input of a trade. */
+  amount: number;
+  symbol: string;
+}
+
+/**
+ * Sera's floor for the token the customer sends, read from the live registry.
+ *
+ * A conversion is a Sera trade, and Sera publishes a per-token `min_trade_amount`
+ * in GET /tokens that it refuses to trade below — the same figure the server
+ * pre-flights before requesting a swap quote (the `amount_below_min` branch in
+ * server/payment-routes.ts). It differs per token and moves with the registry,
+ * so it is always read from there, never written down here.
+ *
+ * Returns null when the token carries no minimum, or when the registry entry
+ * has not loaded yet. Callers must read that as "no minimum known" and let the
+ * amount through rather than inventing a floor of their own.
+ */
+export function getConversionMinimum(coin: Stablecoin | null | undefined): ConversionMinimum | null {
+  if (!coin) return null;
+  const amount = Number(coin.minTradeAmount);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  return { amount, symbol: coin.symbol };
+}
+
+export function conversionMinimumMessage(minimum: ConversionMinimum): string {
+  const figure = minimum.amount.toLocaleString(undefined, { maximumFractionDigits: 6 });
+  return `Minimum amount for this conversion is ${figure} ${minimum.symbol}.`;
+}
+
+export function isBelowConversionMinimum(payAmount: string | number | null | undefined, minimum: ConversionMinimum | null): boolean {
+  if (!minimum) return false;
+  const value = Number(payAmount);
+  return Number.isFinite(value) && value > 0 && value < minimum.amount;
+}
+
+/**
+ * Lifts a pay amount to Sera's floor and re-prices the receive side from the
+ * same rate.
+ *
+ * Both halves have to move together. Raising what the customer pays from
+ * 15,000 to 200,000 IDRT while still telling the merchant they receive 1 USDT
+ * would understate the settlement more than tenfold — the receive figure only
+ * means anything as the rate-converted twin of the pay figure.
+ *
+ * Returns null when nothing needs to change, so callers can leave their own
+ * state untouched.
+ */
+export function applyConversionMinimum(
+  payAmount: string,
+  rate: number | null | undefined,
+  minimum: ConversionMinimum | null,
+): { payAmount: string; receiveAmount: string } | null {
+  if (!minimum || !Number.isFinite(Number(rate)) || Number(rate) <= 0) return null;
+  if (!isBelowConversionMinimum(payAmount, minimum)) return null;
+  return {
+    payAmount: formatDecimalAmount(minimum.amount),
+    receiveAmount: formatDecimalAmount(minimum.amount / Number(rate)),
+  };
 }
 
 export function convertAmount(amount: string | number, rate: number): string {
