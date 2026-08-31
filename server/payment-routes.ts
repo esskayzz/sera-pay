@@ -1257,8 +1257,15 @@ setInterval(() => {
 async function reverifyConfirmingTransactions() {
   try {
     const pending = await getPendingTransactions();
+    // A week covers any realistic gap between a payment landing and a deploy
+    // that can finally verify it — real stuck rows deserve capture, not
+    // abandonment. Older rows are structural leftovers (dead test data, an
+    // unindexable hash); the per-tx backoff already keeps their retries and
+    // log lines rare.
+    const reverifyCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
     for (const tx of pending) {
       if (tx.status !== "confirming") continue;
+      if (new Date(tx.createdAt).getTime() < reverifyCutoff) continue;
       if (isSeraSwapTransaction(tx)) {
         await reconcileSeraSwapTransaction(tx).catch((error) => logSeraOperationFailure("payments/reverify-swap", error));
       } else if (tx.txHash && /^0x[0-9a-fA-F]{64}$/.test(tx.txHash)) {
@@ -3014,7 +3021,25 @@ async function verifyTransactionAsync(txId: string, txHash: `0x${string}`) {
   // Parse Transfer logs from the ERC-20 contract
   let transferVerified = false;
   const tokenDecimals = token.decimals;
-  const expectedRaw = BigInt(toRawTokenAmount(String(tx.amount), tokenDecimals));
+  // Rows written before the create-side precision guard can carry more
+  // decimals than the token itself (rate-derived 6dp figures on 2-decimal
+  // tokens like IDRT). toRawTokenAmount throws on those, and a throw here
+  // re-armed itself through every status poll. Round to the nearest
+  // representable unit instead — that is what the payer's wallet actually
+  // sent — and let the ±1-unit tolerance below absorb the direction. The
+  // float path is only reachable for low-decimal tokens (fractions never
+  // exceed 6 digits), so it stays far inside Number's exact-integer range.
+  let expectedRaw: bigint;
+  try {
+    expectedRaw = BigInt(toRawTokenAmount(String(tx.amount), tokenDecimals));
+  } catch {
+    const scaled = Number(String(tx.amount).replace(/,/g, "")) * 10 ** tokenDecimals;
+    if (!Number.isFinite(scaled) || scaled <= 0) {
+      await failTransactionRecord(tx, `Stored amount ${tx.amount} cannot be expressed in ${tx.coin}'s ${tokenDecimals}-decimal precision.`);
+      return;
+    }
+    expectedRaw = BigInt(Math.round(scaled));
+  }
   for (const log of receipt.logs) {
     if (log.address.toLowerCase() !== coinAddress.toLowerCase()) continue;
     try {
@@ -3058,11 +3083,33 @@ async function verifyTransactionAsync(txId: string, txHash: `0x${string}`) {
   }
 }
 
+/**
+ * Exponential backoff per transaction. Status polls arrive every 5 seconds
+ * from every open checkout, and each used to re-arm verification immediately —
+ * so one fast-throwing row printed the same failure line for hours (the
+ * "[verify] failed" wall). Retrying is still right; retrying at poll frequency
+ * never was.
+ */
+const transactionVerificationFailures = new Map<string, { count: number; nextAttemptAt: number }>();
+
 function scheduleTransactionVerification(txId: string, txHash: `0x${string}`) {
   if (transactionVerificationInFlight.has(txId)) return;
+  const failureState = transactionVerificationFailures.get(txId);
+  if (failureState && Date.now() < failureState.nextAttemptAt) return;
   transactionVerificationInFlight.add(txId);
   void verifyTransactionAsync(txId, txHash)
-    .catch((error) => logSeraOperationFailure("verify", error))
+    .then(() => transactionVerificationFailures.delete(txId))
+    .catch((error) => {
+      const count = (transactionVerificationFailures.get(txId)?.count ?? 0) + 1;
+      const delayMs = Math.min(30_000 * 2 ** (count - 1), 10 * 60_000);
+      transactionVerificationFailures.set(txId, { count, nextAttemptAt: Date.now() + delayMs });
+      // The global logger redacts messages by design, which left these lines
+      // reading "[verify] failed { type: 'Error' }" — undiagnosable. Whether a
+      // merchant reaches paid-state hangs on this path, so name the cause;
+      // truncated and without a stack, since driver errors can carry hosts.
+      const message = error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160);
+      console.error("[verify] failed", { txId, attempt: count, retryInMs: delayMs, message });
+    })
     .finally(() => transactionVerificationInFlight.delete(txId));
 }
 

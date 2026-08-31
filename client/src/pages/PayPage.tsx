@@ -754,9 +754,15 @@ export default function PayPage() {
       if (requestId !== payRateRequestRef.current) return;
       if (data.rate) {
         const converted = parseFloat(amount) * data.rate;
+        // Never derive more decimals than the pay token can express. A
+        // 6-decimal figure on a 2-decimal token (IDRT, EURS) is an amount no
+        // transfer can carry — the server now rejects it at create, so the
+        // customer hit an error before the payment could even start.
+        const payTokenDecimals = Number(supportedCoins.find((c) => c.symbol === payCoin)?.decimals);
+        const maxPayDecimals = Number.isInteger(payTokenDecimals) ? Math.min(6, payTokenDecimals) : 6;
         const formatted = converted >= 1
-          ? converted.toLocaleString(undefined, { maximumFractionDigits: 2 })
-          : formatDecimalAmount(converted);
+          ? converted.toLocaleString(undefined, { maximumFractionDigits: Math.min(2, maxPayDecimals) })
+          : formatDecimalAmount(converted, maxPayDecimals);
         setPayAmount(formatted);
         rateRef.current = data.rate;
         setDisplayRate(`1 ${receiveCoin} ≈ ${data.rate >= 1 ? data.rate.toLocaleString(undefined, { maximumFractionDigits: 4 }) : data.rate.toFixed(6)} ${payCoin}`);

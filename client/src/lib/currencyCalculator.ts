@@ -79,6 +79,7 @@ type SeraTokenPayload = {
   image?: string;
   min_trade_amount?: string;
   walletRecognition?: "universal" | "detected" | "unlisted" | "unknown";
+  walletScanPayable?: boolean;
   verified?: boolean;
   onChainSymbol?: string;
 };
@@ -100,6 +101,7 @@ function buildCurrency(token: SeraTokenPayload): SeraCurrency {
   const parsedMin = Number(token.min_trade_amount);
   const minTradeAmount = Number.isFinite(parsedMin) && parsedMin > 0 ? parsedMin : undefined;
   const walletRecognition = token.walletRecognition;
+  const walletScanPayable = token.walletScanPayable;
   // Carried through so the QR screen can state plainly that this contract was
   // checked on-chain — the reassurance a customer needs when their wallet
   // cannot name the token itself.
@@ -116,6 +118,7 @@ function buildCurrency(token: SeraTokenPayload): SeraCurrency {
       logoUri,
       minTradeAmount,
       walletRecognition,
+      walletScanPayable,
       verified,
       onChainSymbol,
       source: "sera",
@@ -132,6 +135,7 @@ function buildCurrency(token: SeraTokenPayload): SeraCurrency {
     region: REGION_BY_CURRENCY[currency] || "Other",
     minTradeAmount,
     walletRecognition,
+    walletScanPayable,
     verified,
     onChainSymbol,
     source: "sera",

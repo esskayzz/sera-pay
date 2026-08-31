@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import { ZodError } from "zod";
 import { ENV } from "./_core/env";
 import { verifySeraTokens } from "./token-verify";
-import { getWalletRecognition } from "./token-recognition";
+import { getWalletRecognition, getWalletScanPayability } from "./token-recognition";
 import {
   createPaymentIntentInputSchema,
   createSubWalletInputSchema,
@@ -317,10 +317,17 @@ gatewayRouter.get("/sera/tokens", async (req, res) => {
     // heard of it — the URI carries no symbol. Tell the merchant which of their
     // currencies a customer's wallet will actually be able to name.
     const recognitionOf = await getWalletRecognition(chainId);
-    const annotated = tokens.map((token) => ({
-      ...token,
-      walletRecognition: recognitionOf(token.address),
-    }));
+    const scanPayableOf = await getWalletScanPayability(chainId);
+    const annotated = tokens.map((token) => {
+      const walletScanPayable = scanPayableOf(token.address);
+      return {
+        ...token,
+        walletRecognition: recognitionOf(token.address),
+        // Omitted while unproven — the client treats absence as "not scannable"
+        // and routes the QR through the checkout link, which always works.
+        ...(walletScanPayable === null ? {} : { walletScanPayable }),
+      };
+    });
     if (tokens.length > 0) verifiedRegistrySnapshots.set(mode, { tokens, fetchedAt: Date.now() });
     res.json({ tokens: annotated, ...(rejected.length ? { rejected } : {}) });
   } catch (error) {
@@ -333,8 +340,12 @@ gatewayRouter.get("/sera/tokens", async (req, res) => {
       safeGatewayLog("sera/tokens-serving-cached", error);
       const chainId = mode === "test" ? SERA_TESTNET_CHAIN_ID : 1;
       const recognitionOf = await getWalletRecognition(chainId);
+      const scanPayableOf = await getWalletScanPayability(chainId);
       res.json({
-        tokens: snapshot.tokens.map((token) => ({ ...token, walletRecognition: recognitionOf(token.address) })),
+        tokens: snapshot.tokens.map((token) => {
+          const walletScanPayable = scanPayableOf(token.address);
+          return { ...token, walletRecognition: recognitionOf(token.address), ...(walletScanPayable === null ? {} : { walletScanPayable }) };
+        }),
         stale: true,
         stableAsOf: new Date(snapshot.fetchedAt).toISOString(),
       });

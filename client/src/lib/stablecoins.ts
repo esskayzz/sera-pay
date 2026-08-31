@@ -26,6 +26,14 @@ export interface Stablecoin {
    */
   walletRecognition?: "universal" | "detected" | "unlisted" | "unknown";
   /**
+   * True when every curated wallet spend catalog carries this token — the
+   * measured predictor that a scanned EIP-681 request reaches a payable
+   * confirm screen instead of "No <TOKEN> added to your wallet". Populated
+   * from GET /tokens; undefined means unproven and must be read as "route
+   * through the checkout link instead of the scanner".
+   */
+  walletScanPayable?: boolean;
+  /**
    * True once SeraPay has read this contract on-chain and confirmed its symbol
    * and decimals match the Sera registry. This is the claim that matters to a
    * customer looking at an "Unknown" label: the token is real and the request

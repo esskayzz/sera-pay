@@ -42,11 +42,36 @@ const DETECTION_LIST_URLS = [
   "https://tokens.coingecko.com/uniswap/all.json",
 ];
 
+/**
+ * The curated catalogs wallet SPEND lists are assembled from — a different
+ * gate from the naming tiers above, and the one that decides whether a
+ * scanner will let the customer PAY. Measured, not assumed: scanning the same
+ * ERC-681 request, OKX pays USDC/USDT/XSGD — the tokens present in all of
+ * these lists — and refuses tokens missing from any of them ("No ZARP added
+ * to your wallet") even when the customer holds the token. Naming does not
+ * imply spendability: a token can be named by a bundled list yet still be
+ * refused at the send screen.
+ *
+ * Each entry lists a primary URL plus mirrors; the first that answers wins.
+ */
+const CURATED_SPEND_LIST_URLS: string[][] = [
+  ["https://tokens.uniswap.org"],
+  ["https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/ethereum/tokenlist.json"],
+  ["https://tokens.1inch.eth.link", "https://tokens.1inch.eth.limo"],
+];
+
 const REFRESH_MS = 12 * 60 * 60 * 1000;
 
 interface Snapshot {
   bundled: Set<string>;
   detected: Set<string>;
+  /**
+   * Addresses present in EVERY curated spend catalog — the measured predictor
+   * of "a scanned request reaches a payable confirm screen". null while any
+   * catalog is unreachable: a partial fetch would demote well-supported tokens
+   * for no reason, so no data beats wrong data.
+   */
+  spendable: Set<string> | null;
   fetchedAt: number;
 }
 
@@ -86,10 +111,19 @@ async function fetchList(url: string): Promise<string[]> {
   }
 }
 
+async function fetchListWithMirrors(urls: string[]): Promise<string[]> {
+  for (const url of urls) {
+    const addresses = await fetchList(url);
+    if (addresses.length > 0) return addresses;
+  }
+  return [];
+}
+
 async function loadSnapshot(): Promise<Snapshot | null> {
-  const [bundledLists, detectionLists] = await Promise.all([
+  const [bundledLists, detectionLists, curatedLists] = await Promise.all([
     Promise.all(BUNDLED_LIST_URLS.map(fetchList)),
     Promise.all(DETECTION_LIST_URLS.map(fetchList)),
+    Promise.all(CURATED_SPEND_LIST_URLS.map(fetchListWithMirrors)),
   ]);
 
   const bundled = new Set<string>();
@@ -105,10 +139,19 @@ async function loadSnapshot(): Promise<Snapshot | null> {
     }
   }
 
+  // Spendability demands every catalog: intersection over a missing list would
+  // mark genuinely supported tokens unpayable, so an incomplete fetch yields
+  // "unknown" instead.
+  let spendable: Set<string> | null = null;
+  if (curatedLists.every((list) => list.length > 0)) {
+    const sets = curatedLists.map((list) => new Set(list.filter(Boolean).map((address) => address.toLowerCase())));
+    spendable = new Set(Array.from(sets[0]).filter((address) => sets.every((set) => set.has(address))));
+  }
+
   // Every source failed — treat as no data rather than declaring the whole
   // registry "unlisted", which would wrongly warn merchants off every currency.
   if (bundled.size === 0 && detected.size === 0) return null;
-  return { bundled, detected, fetchedAt: Date.now() };
+  return { bundled, detected, spendable, fetchedAt: Date.now() };
 }
 
 function refresh(): Promise<Snapshot | null> {
@@ -144,6 +187,23 @@ export async function getWalletRecognition(chainId: number): Promise<(address: s
   const current = snapshot;
   if (!current) return () => "unknown";
   return classifierFor(current);
+}
+
+/**
+ * Whether a catalog-gated wallet scanner is known to let the customer SPEND
+ * this token from a scanned request. Same never-await contract as the
+ * recognition lookup above. Returns null when unproven — callers must treat
+ * null as "route around the scanner", never as approval.
+ */
+export async function getWalletScanPayability(chainId: number): Promise<(address: string) => boolean | null> {
+  if (chainId !== 1) return () => null;
+
+  const stale = !snapshot || Date.now() - snapshot.fetchedAt > REFRESH_MS;
+  if (stale) void refresh();
+
+  const spendable = snapshot?.spendable;
+  if (!spendable) return () => null;
+  return (address: string) => spendable.has(String(address || "").toLowerCase());
 }
 
 function classifierFor(current: Snapshot) {

@@ -32,6 +32,17 @@ function qrConversionErrorMessage(error: unknown, errorCode?: string | null): st
   return seraRateErrorMessage(error, errorCode);
 }
 
+/**
+ * Formats a rate-derived figure in units the coin can actually carry. The
+ * default 6-decimal formatting produced amounts like 0.317762 IDRT — IDRT has
+ * two decimals, so no on-chain transfer can express that figure and the
+ * server rejects it at payment creation.
+ */
+function formatAmountForCoin(value: number, coin: Stablecoin | null | undefined): string {
+  const decimals = Number(coin?.decimals);
+  return formatDecimalAmount(value, Number.isInteger(decimals) ? Math.min(6, decimals) : 6);
+}
+
 function normalizeQrStyleValue(value: string | null | undefined, fallback: QrStyle = "rounded"): QrStyle {
   if (value === "classy") return "classy-rounded";
   return QR_STYLE_IDS.has(value as QrStyle) ? (value as QrStyle) : fallback;
@@ -2013,7 +2024,7 @@ export default function Home() {
           let nextPay = customerAmount;
           if (lastEdited === "receive" && amount) {
             const calc = (parseFloat(amount) * data.rate);
-            nextPay = isNaN(calc) ? "" : formatDecimalAmount(calc);
+            nextPay = isNaN(calc) ? "" : formatAmountForCoin(calc, customerCoin);
           } else if (lastEdited === "pay" && customerAmount) {
             const calc = (parseFloat(customerAmount) / data.rate);
             nextReceive = isNaN(calc) ? "" : formatDecimalAmount(calc);
@@ -2198,7 +2209,10 @@ export default function Home() {
       // The card has to carry whatever the screen is showing. A receive-only
       // request is answered on the Pay Now page, so its card holds that link;
       // a named pay token is a wallet request, so its card holds the URI.
-      const cardQrValue = isConversionMode
+      // Same carve-out as the on-screen QR: a printed card for a token that
+      // wallet scanners refuse must carry the checkout link instead.
+      const cardTokenScannable = currencies.find((coin) => coin.symbol === displayCoin?.symbol)?.walletScanPayable === true;
+      const cardQrValue = isConversionMode && cardTokenScannable
         ? buildPaymentQrValue({
             receiverAddress,
             coin: displayCoin?.symbol,
@@ -2468,7 +2482,22 @@ export default function Home() {
       Once a pay token IS named there is exactly one transfer to encode, and the
       wallet URI is what makes scan-and-pay work in OKX or MetaMask.
     */
-    const activeQrValue = isConversionMode
+    /*
+      One carve-out from the "Customer Pays set -> wallet URI" rule, measured
+      rather than assumed: a wallet's scanner only builds a send screen for
+      tokens in its own bundled catalog. Scanning the same correct URI, OKX
+      pays USDC but refuses MYRT with "No MYRT added to your wallet" — and no
+      URI variant changes that, because the gate is inside the wallet. The
+      hosted checkout has no such gate: it builds the transfer itself and the
+      wallet merely signs, which is exactly how unlisted-token payments already
+      succeed today. So only tokens PROVEN spendable from a scan (present in
+      every curated wallet catalog — the measured predictor) carry the wallet
+      URI; every other token carries the checkout link with the pay token and
+      amount preset, so the scan always works, at the cost of one confirm step
+      in the browser.
+    */
+    const qrTokenScannable = qrDisplayToken?.walletScanPayable === true;
+    const activeQrValue = isConversionMode && qrTokenScannable
       ? buildPaymentQrValue({
           receiverAddress,
           coin: displayCoin?.symbol,
@@ -2492,7 +2521,7 @@ export default function Home() {
     // before it is applied rather than after.
     const qrEditMinimum = getConversionMinimum(customerCoin);
     const qrEditPayPreview = exchangeRate && customerCoin && qrEditAmount && selectedCoin?.symbol !== customerCoin.symbol
-      ? formatDecimalAmount(parseFloat(qrEditAmount) * exchangeRate)
+      ? formatAmountForCoin(parseFloat(qrEditAmount) * exchangeRate, customerCoin)
       : qrEditAmount;
 
     // The draft amount must not outlive the modal: the receive-coin picker
@@ -2512,7 +2541,7 @@ export default function Home() {
       let nextPayAmount = customerCoin?.symbol === selectedCoin?.symbol ? safeAmount : normalizeDecimalAmountText(customerAmount);
       if (exchangeRate && customerCoin && selectedCoin?.symbol !== customerCoin?.symbol) {
         const calc = parseFloat(safeAmount) * exchangeRate;
-        nextPayAmount = isNaN(calc) ? "" : formatDecimalAmount(calc);
+        nextPayAmount = isNaN(calc) ? "" : formatAmountForCoin(calc, customerCoin);
       }
       // The merchant edits what they receive; the customer's side is derived,
       // so if the derivation lands under Sera's floor it is the derivation that
@@ -2560,7 +2589,7 @@ export default function Home() {
           if (requestId !== qrRateRequestRef.current) return;
           if (data.rate) {
             const calc = parseFloat(amount) * data.rate;
-            let newPayAmount = isNaN(calc) ? "" : formatDecimalAmount(calc);
+            let newPayAmount = isNaN(calc) ? "" : formatAmountForCoin(calc, coin);
             let newReceiveAmount = normalizeDecimalAmountText(amount);
             // Each pay token carries its own floor, so a route that was fine a
             // moment ago may not convert this amount at all.
