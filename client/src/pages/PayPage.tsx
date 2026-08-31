@@ -640,6 +640,51 @@ export default function PayPage() {
     setAmountError("");
   }, [hasOrderItems, isOpenAmount, orderMinimumPayAmount, payAmount, selectedCoin?.symbol, unifiedCoin]);
 
+  /*
+    The connected wallet's balance of the selected coin. Asked for by the
+    merchant ("show their balance when they are trying to pay") and it answers
+    the support case that actually happened: a payer holding the token on one
+    account while OKX had a different, empty account active — the wallet's
+    "insufficient balance" was correct, but nothing on the page showed WHICH
+    wallet was about to pay or what it held.
+  */
+  const [walletBalance, setWalletBalance] = useState<string | null>(null);
+  const activeWalletAddress = wallets?.[0]?.address;
+  useEffect(() => {
+    setWalletBalance(null);
+    const tokenAddress = String(selectedCoin?.contractAddress || "");
+    const tokenDecimals = Number(selectedCoin?.decimals);
+    if (!activeWalletAddress || !/^0x[0-9a-fA-F]{40}$/.test(tokenAddress) || !Number.isInteger(tokenDecimals)) return;
+    const chainRpc: Record<number, string> = {
+      11155111: import.meta.env.VITE_SEPOLIA_RPC_URL || "https://ethereum-sepolia-rpc.publicnode.com",
+      1: import.meta.env.VITE_MAINNET_RPC_URL || "https://ethereum-rpc.publicnode.com",
+    };
+    const rpc = chainRpc[chainId] || chainRpc[LIVE_PAYMENT_CHAIN_ID];
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(rpc, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "eth_call",
+            params: [{ to: tokenAddress, data: "0x70a08231" + activeWalletAddress.slice(2).toLowerCase().padStart(64, "0") }, "latest"],
+          }),
+        });
+        const data = await res.json();
+        if (cancelled || typeof data.result !== "string" || !/^0x[0-9a-fA-F]*$/.test(data.result)) return;
+        const raw = BigInt(data.result === "0x" ? "0x0" : data.result);
+        const scale = 10n ** BigInt(tokenDecimals);
+        const whole = raw / scale;
+        const fraction = (raw % scale).toString().padStart(tokenDecimals, "0").replace(/0+$/, "");
+        setWalletBalance(fraction ? `${whole}.${fraction}` : whole.toString());
+      } catch { /* leave the line hidden rather than show a wrong figure */ }
+    })();
+    return () => { cancelled = true; };
+  }, [activeWalletAddress, selectedCoin?.contractAddress, selectedCoin?.decimals, chainId]);
+
   // Gas fee estimation
   const [gasUsd, setGasUsd] = useState<string | null>(null);
   useEffect(() => {
@@ -1676,6 +1721,21 @@ export default function PayPage() {
                     </span>
                   </div>
                 )}
+                {/* Connected wallet's balance of the selected coin. Turns red
+                    when it cannot cover the amount due, so a wrong active
+                    account is visible before the wallet rejects the payment. */}
+                {walletBalance !== null && selectedCoin ? (
+                  <p style={{
+                    fontSize: 11,
+                    margin: "8px 0 0",
+                    fontVariantNumeric: "tabular-nums",
+                    color: Number(walletBalance) < Number(String(payAmount ?? "").replace(/,/g, "") || 0)
+                      ? "#B42318"
+                      : "rgba(60,60,67,0.35)",
+                  }}>
+                    Balance: {walletBalance} {selectedCoin.symbol}
+                  </p>
+                ) : null}
               </>
             )}
           </div>

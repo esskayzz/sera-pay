@@ -1609,11 +1609,32 @@ function setPaymentSoundMuted(muted: boolean) {
  * merchant is standing when a scanned payment lands — so the sound seemed
  * broken there. The mute toggle now persists and both paths respect it.
  */
+/**
+ * Prefer a softer female voice for the announcement. Voice inventories differ
+ * per OS/browser and load asynchronously, so this re-picks on every call and
+ * silently falls back to the platform default when nothing matches.
+ */
+function pickPaymentVoice(): SpeechSynthesisVoice | null {
+  try {
+    const voices = window.speechSynthesis.getVoices();
+    const english = voices.filter((voice) => /^en/i.test(voice.lang));
+    const pool = english.length ? english : voices;
+    const preferred = [/aria/i, /jenny/i, /libby/i, /sonia/i, /samantha/i, /zira/i, /female/i, /google uk english female/i];
+    for (const pattern of preferred) {
+      const match = pool.find((voice) => pattern.test(voice.name));
+      if (match) return match;
+    }
+  } catch {}
+  return null;
+}
+
 function speakPaymentReceived(amount: string, coin: string) {
   try {
     if (isPaymentSoundMuted() || !window.speechSynthesis) return;
     const msg = new SpeechSynthesisUtterance(`Payment received. ${amount} ${coin}.`);
-    msg.rate = 0.95; msg.pitch = 1.0; msg.volume = 1.0;
+    const voice = pickPaymentVoice();
+    if (voice) msg.voice = voice;
+    msg.rate = 0.95; msg.pitch = 1.05; msg.volume = 1.0;
     window.speechSynthesis.cancel();
     window.speechSynthesis.speak(msg);
   } catch {}
@@ -2209,10 +2230,8 @@ export default function Home() {
       // The card has to carry whatever the screen is showing. A receive-only
       // request is answered on the Pay Now page, so its card holds that link;
       // a named pay token is a wallet request, so its card holds the URI.
-      // Same carve-out as the on-screen QR: a printed card for a token that
-      // wallet scanners refuse must carry the checkout link instead.
-      const cardTokenScannable = currencies.find((coin) => coin.symbol === displayCoin?.symbol)?.walletScanPayable === true;
-      const cardQrValue = isConversionMode && cardTokenScannable
+      // Mirrors the on-screen rule: Customer Pays set -> always the wallet URI.
+      const cardQrValue = isConversionMode
         ? buildPaymentQrValue({
             receiverAddress,
             coin: displayCoin?.symbol,
@@ -2483,21 +2502,14 @@ export default function Home() {
       wallet URI is what makes scan-and-pay work in OKX or MetaMask.
     */
     /*
-      One carve-out from the "Customer Pays set -> wallet URI" rule, measured
-      rather than assumed: a wallet's scanner only builds a send screen for
-      tokens in its own bundled catalog. Scanning the same correct URI, OKX
-      pays USDC but refuses MYRT with "No MYRT added to your wallet" — and no
-      URI variant changes that, because the gate is inside the wallet. The
-      hosted checkout has no such gate: it builds the transfer itself and the
-      wallet merely signs, which is exactly how unlisted-token payments already
-      succeed today. So only tokens PROVEN spendable from a scan (present in
-      every curated wallet catalog — the measured predictor) carry the wallet
-      URI; every other token carries the checkout link with the pay token and
-      amount preset, so the scan always works, at the cost of one confirm step
-      in the browser.
+      No per-token exceptions: Customer Pays set means the wallet URI with the
+      preset amount, always — the owner's explicit rule. Some wallet scanners
+      refuse tokens outside their own catalogs ("No MYRT added to your
+      wallet"); that gate is inside the wallet and, by decision, we do not
+      route around it here. walletScanPayable still arrives from the server
+      for any future per-wallet deeplink work.
     */
-    const qrTokenScannable = qrDisplayToken?.walletScanPayable === true;
-    const activeQrValue = isConversionMode && qrTokenScannable
+    const activeQrValue = isConversionMode
       ? buildPaymentQrValue({
           receiverAddress,
           coin: displayCoin?.symbol,
@@ -2532,25 +2544,59 @@ export default function Home() {
       setQrEditMode(false);
     };
 
-    const handleQrEditSave = () => {
+    const handleQrEditSave = async () => {
       if (!qrEditAmount || isNaN(parseFloat(qrEditAmount))) { closeQrEdit(); return; }
       const safeAmount = normalizeDecimalAmountText(qrEditAmount);
       if (!safeAmount) { closeQrEdit(); return; }
       // Recalculate customer amount
       let nextReceiveAmount = safeAmount;
       let nextPayAmount = customerCoin?.symbol === selectedCoin?.symbol ? safeAmount : normalizeDecimalAmountText(customerAmount);
-      if (exchangeRate && customerCoin && selectedCoin?.symbol !== customerCoin?.symbol) {
-        const calc = parseFloat(safeAmount) * exchangeRate;
-        nextPayAmount = isNaN(calc) ? "" : formatAmountForCoin(calc, customerCoin);
-      }
-      // The merchant edits what they receive; the customer's side is derived,
-      // so if the derivation lands under Sera's floor it is the derivation that
-      // moves — and the receive figure moves with it to stay its rate-converted
-      // twin. In receive-only mode there is no derivation and no floor.
-      const lifted = applyConversionMinimum(nextPayAmount, exchangeRate, getConversionMinimum(customerCoin));
-      if (lifted) {
-        nextPayAmount = lifted.payAmount;
-        nextReceiveAmount = lifted.receiveAmount;
+      if (customerCoin && selectedCoin && selectedCoin.symbol !== customerCoin.symbol) {
+        /*
+          Always price the save off a fresh quote. The stored exchangeRate can
+          belong to a pair the merchant switched away from seconds ago, or be
+          missing entirely while that switch's fetch is still in flight — which
+          made the first Done appear to do nothing until a second attempt ran
+          with settled state. The server caches quotes, so this is cheap.
+        */
+        const requestId = ++qrRateRequestRef.current;
+        setQrRateLoading(true);
+        try {
+          const rateRes = await fetch(`/api/rates?from=${selectedCoin.symbol}&to=${customerCoin.symbol}&chainId=${paymentChainId}`);
+          const rateData = await rateRes.json().catch(() => ({}));
+          if (!rateRes.ok || !rateData.rate) {
+            throw Object.assign(new Error(rateData.detail || rateData.error || ""), { errorCode: rateData.errorCode });
+          }
+          if (requestId !== qrRateRequestRef.current) return;
+          setExchangeRate(rateData.rate);
+          setConversionError("");
+          const calc = parseFloat(safeAmount) * rateData.rate;
+          nextPayAmount = isNaN(calc) ? "" : formatAmountForCoin(calc, customerCoin);
+          // The merchant edits what they receive; the customer's side is
+          // derived, so if the derivation lands under Sera's floor it is the
+          // derivation that moves — and the receive figure moves with it to
+          // stay its rate-converted twin.
+          const lifted = applyConversionMinimum(nextPayAmount, rateData.rate, getConversionMinimum(customerCoin));
+          if (lifted) {
+            nextPayAmount = lifted.payAmount;
+            nextReceiveAmount = lifted.receiveAmount;
+          }
+        } catch (error) {
+          if (requestId === qrRateRequestRef.current) {
+            setConversionError(qrConversionErrorMessage(error));
+            setQrRateLoading(false);
+          }
+          return; // keep the modal open so the merchant sees why nothing moved
+        }
+        setQrRateLoading(false);
+      } else {
+        // Same-coin or receive-only: nothing is derived, but a same-coin
+        // request can still sit under the token's own Sera floor.
+        const lifted = applyConversionMinimum(nextPayAmount, exchangeRate, getConversionMinimum(customerCoin));
+        if (lifted) {
+          nextPayAmount = lifted.payAmount;
+          nextReceiveAmount = lifted.receiveAmount;
+        }
       }
       setAmount(nextReceiveAmount);
       if (customerCoin) setCustomerAmount(nextPayAmount);
