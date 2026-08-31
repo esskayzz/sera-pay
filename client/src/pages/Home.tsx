@@ -20,6 +20,7 @@ import { MAX_IMAGE_UPLOAD_BYTES, loadImage, readFileAsDataUrl, renderCroppedImag
 import { formatDecimalAmount, limitDecimalPlaces, normalizeDecimalAmountText } from "@/lib/decimalInput";
 import { downloadPaymentQrCard } from "@/lib/qrDownload";
 import { StablecoinLogo } from "@/components/StablecoinLogo";
+import { RouteLoadingFallback } from "@/components/RouteLoadingFallback";
 
 const font = "-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', sans-serif";
 const SERAPAY_LOGO_URL = "/icon-512.png";
@@ -2472,6 +2473,11 @@ export default function Home() {
   }
 
   if (isConnected && !merchantWorkspaceReady) {
+    // Management's call: while the workspace is simply loading, show the one
+    // standard loading screen — no dedicated "Preparing" copy. The setup
+    // screen remains for actual failures, where Retry and Disconnect are the
+    // only way out.
+    if (!accountSetupError) return <RouteLoadingFallback />;
     return (
       <AccountSetupScreen
         walletAddress={walletAddress}
