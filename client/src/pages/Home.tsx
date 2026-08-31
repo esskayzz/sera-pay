@@ -1582,9 +1582,36 @@ function GuestReceiverModal({
   );
 }
 
+const SOUND_MUTED_KEY = "serapay_sound_muted";
+
+function isPaymentSoundMuted(): boolean {
+  try { return localStorage.getItem(SOUND_MUTED_KEY) === "1"; } catch { return false; }
+}
+
+function setPaymentSoundMuted(muted: boolean) {
+  try { localStorage.setItem(SOUND_MUTED_KEY, muted ? "1" : "0"); } catch {}
+}
+
+/**
+ * One announcer for every payment toast. The spoken alert lived only inside
+ * TransactionHistory, which unmounts on the QR screen — exactly where the
+ * merchant is standing when a scanned payment lands — so the sound seemed
+ * broken there. The mute toggle now persists and both paths respect it.
+ */
+function speakPaymentReceived(amount: string, coin: string) {
+  try {
+    if (isPaymentSoundMuted() || !window.speechSynthesis) return;
+    const msg = new SpeechSynthesisUtterance(`Payment received. ${amount} ${coin}.`);
+    msg.rate = 0.95; msg.pitch = 1.0; msg.volume = 1.0;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(msg);
+  } catch {}
+}
+
 function PaymentToast({ amount, coin, onDismiss }: { amount: string; coin: string; onDismiss: () => void }) {
+  // Long enough to be seen from across a counter; Dismiss closes it sooner.
   useEffect(() => {
-    const t = setTimeout(onDismiss, 5000);
+    const t = setTimeout(onDismiss, 30000);
     return () => clearTimeout(t);
   }, [onDismiss]);
   return (
@@ -1603,7 +1630,16 @@ function PaymentToast({ amount, coin, onDismiss }: { amount: string; coin: strin
           <div style={{ fontSize: 13, opacity: 0.9 }}>{amount} {coin}</div>
         </div>
       </div>
-      <button onClick={onDismiss} style={{ background: "none", border: "none", color: "#fff", fontSize: 20, cursor: "pointer", opacity: 0.8, padding: "0 4px" }}>×</button>
+      <button
+        onClick={onDismiss}
+        onMouseEnter={(e) => { e.currentTarget.style.background = "#fff"; e.currentTarget.style.color = "#00A855"; }}
+        onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "#fff"; }}
+        style={{
+          background: "transparent", border: "1px solid rgba(255,255,255,0.55)", borderRadius: 10,
+          color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer",
+          padding: "7px 14px", transition: "background 0.15s, color 0.15s", flexShrink: 0,
+        }}
+      >Dismiss</button>
     </div>
   );
 }
@@ -1613,7 +1649,7 @@ function TransactionHistory({ apiKey, chainId }: { apiKey: string; chainId: numb
   const [txs, setTxs] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [muted, setMuted] = useState(false);
+  const [muted, setMuted] = useState(isPaymentSoundMuted);
   const [toast, setToast] = useState<{ amount: string; coin: string } | null>(null);
   // Track known confirmed tx IDs to detect new arrivals
   const knownConfirmedIds = useRef<Set<string>>(new Set());
@@ -1622,14 +1658,8 @@ function TransactionHistory({ apiKey, chainId }: { apiKey: string; chainId: numb
   const notifyPayment = useCallback((amount: string, coin: string) => {
     // Show toast banner
     setToast({ amount, coin });
-    // Speak if not muted
-    if (!muted && window.speechSynthesis) {
-      const msg = new SpeechSynthesisUtterance(`Payment received. ${amount} ${coin}.`);
-      msg.rate = 0.95; msg.pitch = 1.0; msg.volume = 1.0;
-      window.speechSynthesis.cancel();
-      window.speechSynthesis.speak(msg);
-    }
-  }, [muted]);
+    speakPaymentReceived(amount, coin);
+  }, []);
 
   const fetchTxs = useCallback(async () => {
     if (!apiKey) return;
@@ -1694,7 +1724,7 @@ function TransactionHistory({ apiKey, chainId }: { apiKey: string; chainId: numb
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           {/* Mute toggle */}
           <button
-            onClick={() => setMuted(m => !m)}
+            onClick={() => setMuted(m => { setPaymentSoundMuted(!m); return !m; })}
             title={muted ? "Unmute notifications" : "Mute notifications"}
             style={{ background: "none", border: "none", cursor: "pointer", padding: "2px 4px", fontSize: 16, opacity: muted ? 0.35 : 0.7, lineHeight: 1 }}
           >
@@ -1828,6 +1858,12 @@ export default function Home() {
   const qrRateRequestRef = useRef(0);
   const directQrScanFromBlockRef = useRef<string | null>(null);
   const directQrScanKeyRef = useRef("");
+  // One announcement per payment, full stop. Dismissing the toast used to
+  // null directQrPayment, which restarted the poller, which re-found the same
+  // on-chain transfer and raised the same toast again every few seconds — a
+  // loop that reads as many customers paying when exactly one did.
+  const directQrCompletedKeyRef = useRef("");
+  const directQrNotifiedHashesRef = useRef<Set<string>>(new Set());
   const [directQrPayment, setDirectQrPayment] = useState<{ amount: string; coin: string } | null>(null);
 
   const walletAddress = authWalletAddress ||
@@ -2205,6 +2241,7 @@ export default function Home() {
     setDirectQrPayment(null);
     directQrScanFromBlockRef.current = null;
     directQrScanKeyRef.current = "";
+    directQrCompletedKeyRef.current = "";
     // If description is pre-filled, auto-open advanced options so user knows it's there
     if (description.trim()) setShowAdvanced(true);
   }, [description]);
@@ -2218,6 +2255,8 @@ export default function Home() {
     if (directQrPayment) return;
 
     const scanKey = `${receiverAddress.toLowerCase()}:${coin}:${scanAmount}:${paymentChainId}:${paymentUrl}`;
+    // This QR was already paid and announced; do not poll it back to life.
+    if (directQrCompletedKeyRef.current === scanKey) return;
     if (directQrScanKeyRef.current !== scanKey) {
       directQrScanKeyRef.current = scanKey;
       directQrScanFromBlockRef.current = null;
@@ -2251,7 +2290,13 @@ export default function Home() {
           directQrScanFromBlockRef.current = String(data.fromBlock);
         }
         if (data.status === "confirmed") {
-          setDirectQrPayment({ amount: scanAmount, coin });
+          directQrCompletedKeyRef.current = scanKey;
+          const paymentHash = typeof data.txHash === "string" ? data.txHash.toLowerCase() : "";
+          if (!paymentHash || !directQrNotifiedHashesRef.current.has(paymentHash)) {
+            if (paymentHash) directQrNotifiedHashesRef.current.add(paymentHash);
+            setDirectQrPayment({ amount: scanAmount, coin });
+            speakPaymentReceived(scanAmount, coin);
+          }
           setConversionError("");
           queryClient.invalidateQueries({ queryKey: ["/merchant/transactions"] });
           queryClient.invalidateQueries({ queryKey: ["/merchant/stats"] });

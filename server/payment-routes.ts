@@ -1241,8 +1241,36 @@ setInterval(() => {
     // under the customer who just sent real funds.
     await sweepPendingMerchantDirectActivity();
     await cancelAllStalePendingTransactions();
+    await reverifyConfirmingTransactions();
   })();
 }, 60_000);
+
+/**
+ * Re-checks every "confirming" row on the server's own clock.
+ *
+ * Verification was previously re-armed only by the payer's status polls, so a
+ * payer who broadcast from their wallet and then closed the tab left a payment
+ * that had settled on-chain sitting at "Processing" forever — the merchant's
+ * transaction list never triggers verification. The transfer is real money
+ * already received; finding it must not depend on the customer's browser.
+ */
+async function reverifyConfirmingTransactions() {
+  try {
+    const pending = await getPendingTransactions();
+    for (const tx of pending) {
+      if (tx.status !== "confirming") continue;
+      if (isSeraSwapTransaction(tx)) {
+        await reconcileSeraSwapTransaction(tx).catch((error) => logSeraOperationFailure("payments/reverify-swap", error));
+      } else if (tx.txHash && /^0x[0-9a-fA-F]{64}$/.test(tx.txHash)) {
+        // Fire-and-forget with a per-tx in-flight guard, so a slow receipt
+        // wait never stacks a second watcher for the same payment.
+        scheduleTransactionVerification(tx.id, tx.txHash as `0x${string}`);
+      }
+    }
+  } catch (error) {
+    logSeraOperationFailure("payments/reverify", error);
+  }
+}
 
 type SeraTrackedOrder = {
   status?: string;

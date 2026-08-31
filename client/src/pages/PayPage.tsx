@@ -507,7 +507,6 @@ export default function PayPage() {
   const [phase, setPhase] = useState<Phase>("loading");
   const [req, setReq] = useState<ReturnType<typeof decodePaymentRequest> | null>(null);
   const [selectedCoin, setSelectedCoin] = useState<Stablecoin | null>(null);
-  const [addTokenState, setAddTokenState] = useState<"idle" | "adding" | "added">("idle");
   const [payerChangedCoinInCheckout, setPayerChangedCoinInCheckout] = useState(false);
   const [supportedCoins, setSupportedCoins] = useState<SeraCurrency[]>([]);
   const [registryLoading, setRegistryLoading] = useState(true);
@@ -854,40 +853,6 @@ export default function PayPage() {
       if (pollInterval) clearInterval(pollInterval);
     };
   }, [txId]);
-
-  // "Added" refers to one specific token; switching currency makes it stale.
-  useEffect(() => { setAddTokenState("idle"); }, [selectedCoin?.symbol]);
-
-  const handleAddTokenToWallet = useCallback(async () => {
-    if (!selectedCoin) return;
-    const address = String(selectedCoin.contractAddress || "");
-    const decimals = Number(selectedCoin.decimals);
-    if (!/^0x[0-9a-fA-F]{40}$/.test(address) || !Number.isInteger(decimals)) return;
-    setAddTokenState("adding");
-    try {
-      const wallet = wallets?.[0];
-      if (!wallet) throw new Error("Connect a wallet first");
-      const provider = await wallet.getEthereumProvider();
-      // Register the token on the same chain the payment will settle on,
-      // otherwise the wallet files it under whatever network it happens to be
-      // showing and still cannot name it at confirmation time.
-      await switchPaymentChain(provider, req?.chainId ?? LIVE_PAYMENT_CHAIN_ID);
-      const added = await addTokenToWallet(provider, {
-        address,
-        symbol: selectedCoin.symbol,
-        decimals,
-        image: selectedCoin.logoUri,
-      });
-      // Some wallets accept the call and do nothing. Claiming success then
-      // would tell the customer the token is registered while their next
-      // screen still says "Unknown" — leave the offer up instead.
-      setAddTokenState(added ? "added" : "idle");
-    } catch {
-      // Declining the prompt is a normal outcome, not an error worth shouting
-      // about — the payment still works, the wallet just shows "Unknown".
-      setAddTokenState("idle");
-    }
-  }, [selectedCoin, wallets, req?.chainId]);
 
   const executePay = useCallback(async (finalPayAmount: string, finalReceiveAmount?: string) => {
     if (!req || !selectedCoin) return;
@@ -1799,34 +1764,6 @@ export default function PayPage() {
                   <span style={{ fontSize: 12, color: "rgba(60,60,67,0.5)" }}>Network</span>
                   <span style={{ fontSize: 12, fontWeight: 600, color: "#1C1C1E" }}>{CHAIN_NAMES[chainId] || "Ethereum"}</span>
                 </div>
-              </div>
-            )}
-            {/*
-              Wallets resolve a token's name from their own list, not from the
-              payment request, so a currency they have never seen confirms as
-              "Unknown". One tap registers it and the name appears correctly.
-            */}
-            {selectedCoin && selectedCoinSupported && selectedCoin.walletRecognition && selectedCoin.walletRecognition !== "universal" && (
-              <div style={{ background: "#F4F9FF", border: "1px solid rgba(0,122,255,0.18)", borderRadius: 14, padding: "12px 14px", marginBottom: 16 }}>
-                <p style={{ margin: "0 0 10px", fontSize: 12, lineHeight: 1.5, color: "#1C3D5A", fontWeight: 600 }}>
-                  {addTokenState === "added"
-                    ? `${selectedCoin.symbol} is now in your wallet — it will show by name when you confirm.`
-                    : `Your wallet may show ${selectedCoin.symbol} as "Unknown". Add it once and it will always show by name.`}
-                </p>
-                {addTokenState !== "added" && (
-                  <button
-                    type="button"
-                    onClick={handleAddTokenToWallet}
-                    disabled={addTokenState === "adding"}
-                    style={{
-                      width: "100%", height: 38, borderRadius: 11, border: "1px solid rgba(0,122,255,0.3)",
-                      background: "#fff", color: "#0A66C2", fontSize: 12.5, fontWeight: 700,
-                      cursor: addTokenState === "adding" ? "wait" : "pointer", fontFamily: font,
-                    }}
-                  >
-                    {addTokenState === "adding" ? "Check your wallet…" : `Add ${selectedCoin.symbol} to my wallet`}
-                  </button>
-                )}
               </div>
             )}
             {!selectedCoin && (
