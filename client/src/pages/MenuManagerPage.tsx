@@ -10,7 +10,7 @@ import {
   ChevronDown, UtensilsCrossed, Search, WalletCards,
 } from "lucide-react";
 import { toast } from "sonner";
-import { buildPaymentUrl, buildWalletPaymentUri, resolvePaymentChainId, OrderItem } from "@/lib/payment";
+import { buildWalletPaymentUri, requestSignedPaymentUrl, resolvePaymentChainId, OrderItem } from "@/lib/payment";
 import { buildClientAppUrl } from "@/lib/app-url";
 import { useMerchantProfile } from "@/hooks/use-merchant";
 import { useSeraToken } from "@/hooks/use-sera-token";
@@ -1048,7 +1048,7 @@ function CartSidebar({
         c: e.item.coin || undefined,
       }));
       const paymentAmount = formatDecimalAmount(paymentTotal) || paymentTotal.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
-      const url = buildPaymentUrl({
+      const url = await requestSignedPaymentUrl({
         receiverAddress,
         receiveCoin,
         amount: paymentAmount,

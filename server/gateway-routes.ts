@@ -29,6 +29,7 @@ import {
 import { requireApiKey } from "./payment-routes";
 import { screenWalletAddress } from "./compliance";
 import { decryptSecret, encryptSecret, isSecretEncryptionReady, maskSecret } from "./secret-vault";
+import { signCheckoutPayload } from "./checkout-payload";
 import {
   DEFAULT_SERA_API_BASE_URL,
   DEFAULT_SERA_API_TESTNET_BASE_URL,
@@ -119,10 +120,13 @@ function getPublicBaseUrl(req: any): string {
   return `${req.protocol}://${req.get("host")}`;
 }
 
+/**
+ * Checkout payloads are signed (see server/checkout-payload.ts): the payer's
+ * checkout sends the segment back to /api/payment/*, which refuses anything
+ * that does not authenticate.
+ */
 function encodeCheckoutPayload(payload: Record<string, unknown>): string {
-  return Buffer.from(JSON.stringify(payload), "utf8")
-    .toString("base64url")
-    .replace(/=+$/, "");
+  return signCheckoutPayload(payload);
 }
 
 /** Sepolia is only ever reachable when the server explicitly enables it. */

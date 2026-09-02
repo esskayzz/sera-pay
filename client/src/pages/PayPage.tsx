@@ -4,7 +4,7 @@ import { usePrivy, useWallets } from "@privy-io/react-auth";
 import { parseUnits } from "viem";
 import { ChevronDown, ChevronRight, Wallet } from "lucide-react";
 import { type Stablecoin } from "@/lib/stablecoins";
-import { decodePaymentRequest, getCrossCurrencyReceiveLabel, LIVE_PAYMENT_CHAIN_ID, SERA_NO_LIQUIDITY_MESSAGE, seraRateErrorMessage, TEST_PAYMENT_CHAIN_ID } from "@/lib/payment";
+import { decodeCheckoutPayload, getCrossCurrencyReceiveLabel, LIVE_PAYMENT_CHAIN_ID, SERA_NO_LIQUIDITY_MESSAGE, seraRateErrorMessage, TEST_PAYMENT_CHAIN_ID, type PaymentRequest } from "@/lib/payment";
 import { buildClientAppUrl } from "@/lib/app-url";
 import { getCurrencyRate, loadSeraCurrencies, type SeraCurrency } from "@/lib/currencyCalculator";
 import { formatDecimalAmount, limitDecimalPlaces, normalizeDecimalAmountText } from "@/lib/decimalInput";
@@ -505,7 +505,7 @@ export default function PayPage() {
   const isConnected = authenticated;
 
   const [phase, setPhase] = useState<Phase>("loading");
-  const [req, setReq] = useState<ReturnType<typeof decodePaymentRequest> | null>(null);
+  const [req, setReq] = useState<PaymentRequest | null>(null);
   const [selectedCoin, setSelectedCoin] = useState<Stablecoin | null>(null);
   const [payerChangedCoinInCheckout, setPayerChangedCoinInCheckout] = useState(false);
   const [supportedCoins, setSupportedCoins] = useState<SeraCurrency[]>([]);
@@ -720,8 +720,14 @@ export default function PayPage() {
   useEffect(() => {
     if (!encoded) { setPhase("invalid"); return; }
     try {
-      const decoded = decodePaymentRequest(encoded);
-      if (!decoded?.receiverAddress) { setPhase("invalid"); return; }
+      const checkout = decodeCheckoutPayload(encoded);
+      if (!checkout?.request?.receiverAddress) { setPhase("invalid"); return; }
+      // The browser cannot verify the server signature, but it can see whether
+      // one exists. An unsigned segment is either a legacy link or a forged
+      // one — there is no way to tell those apart, and both are refused. The
+      // server performs the real verification when the payment is created.
+      if (!checkout.signed) { setPhase("invalid"); return; }
+      const decoded = checkout.request;
       setReq(decoded);
       setPayerChangedCoinInCheckout(false);
       // Check expiry
@@ -949,6 +955,7 @@ export default function PayPage() {
               orderId: (req as any).orderId,
               expiration: swapExpiration,
               txId: quoteTransactionId || undefined,
+              checkoutPayload: encoded || undefined,
             }),
           });
           const quoteData = await readPaymentApiJson<any>(quoteRes, "Unable to create Sera swap quote");
@@ -1079,6 +1086,7 @@ export default function PayPage() {
           orderId: (req as any).orderId,
           paymentIntentId: (req as any).paymentIntentId,
           paymentUrl: window.location.href,
+          checkoutPayload: encoded || undefined,
         }),
       });
       const createData = await readPaymentApiJson<any>(createRes, "Unable to create payment");
@@ -1121,7 +1129,7 @@ export default function PayPage() {
         setPhase("failed");
       }
     }
-  }, [req, selectedCoin, wallets, requiresSeraSwap, receiveAmount]);
+  }, [req, selectedCoin, wallets, requiresSeraSwap, receiveAmount, encoded]);
 
   const openPrivyLogin = useCallback((loginMethods?: PaymentLoginMethod[]) => {
     try {

@@ -9,10 +9,17 @@ import { eq, and, asc, lte, or, isNull } from "drizzle-orm";
 import { v4 as uuidv4 } from "uuid";
 import { requireApiKey } from "./payment-routes";
 import { storagePut } from "./storage";
+import { signCheckoutPayload } from "./checkout-payload";
+import { ENV } from "./_core/env";
 
 export const menuRouter = Router();
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+function publicBaseUrl(req: any): string {
+  if (ENV.paymentBaseUrl) return ENV.paymentBaseUrl.replace(/\/+$/, "");
+  return `${req.protocol}://${req.get("host")}`;
+}
 
 function slugify(text: string): string {
   return text
@@ -417,7 +424,11 @@ menuRouter.post("/public/menu/:slug/orders", async (req, res) => {
     const [menu] = await db.select().from(menus).where(and(eq(menus.slug, slug), eq(menus.isActive, 1)));
     if (!menu) { res.status(404).json({ error: "Menu not found" }); return; }
     await clearExpiredSoldOutItems(db, menu.id);
-    const [merchant] = await db.select({ receiveCoin: merchants.receiveCoin }).from(merchants).where(eq(merchants.id, menu.merchantId));
+    const [merchant] = await db.select({
+      receiveCoin: merchants.receiveCoin,
+      walletAddress: merchants.walletAddress,
+      storeAddress: merchants.storeAddress,
+    }).from(merchants).where(eq(merchants.id, menu.merchantId));
 
     const pax = Math.max(1, Math.min(99, Number.parseInt(String(req.body?.pax ?? "1"), 10) || 1));
     const requestedItems = Array.isArray(req.body?.items) ? req.body.items : [];
@@ -494,6 +505,25 @@ menuRouter.post("/public/menu/:slug/orders", async (req, res) => {
       orderedAt: new Date(),
     });
 
+    // The checkout payload is built and signed here, server-side, from the
+    // stored order — never from browser-supplied totals. The payer's checkout
+    // refuses unsigned payloads, so a re-encoded menu link cannot redirect or
+    // reprice an order.
+    const receiveAddress = String(merchant?.storeAddress || merchant?.walletAddress || "").toLowerCase();
+    const checkoutCoin = hasMixedCoins ? (merchant?.receiveCoin || firstCoin) : firstCoin;
+    const encoded = signCheckoutPayload({
+      receiverAddress: receiveAddress,
+      receiveCoin: checkoutCoin,
+      amount: total.toFixed(6),
+      chainId: 1,
+      orderId,
+      menuName: menu.name,
+      menuSlug: menu.slug,
+      orderItems: orderItems.map((item) => ({ id: item.id, n: item.name, p: item.price, q: item.qty, c: item.coin })),
+      description: `Order: ${orderItems.map((item) => `${item.qty}× ${item.name}`).join(", ")}`.slice(0, 300),
+      _n: uuidv4().replace(/-/g, "").slice(0, 8),
+    });
+
     res.status(201).json({
       id: orderId,
       menuId: menu.id,
@@ -503,6 +533,7 @@ menuRouter.post("/public/menu/:slug/orders", async (req, res) => {
       coin: hasMixedCoins ? (merchant?.receiveCoin || firstCoin) : firstCoin,
       items: orderItems,
       status: "created",
+      checkout: { encoded, paymentUrl: `${publicBaseUrl(req)}/pay/${encoded}` },
     });
   } catch (e) { console.error(e); res.status(500).json({ error: "Internal server error" }); }
 });
