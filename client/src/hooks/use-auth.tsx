@@ -382,6 +382,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
         if (controller.signal.aborted) return;
 
+        /*
+          A Privy access token can be accepted by the SDK and still be rejected
+          by the server moments later — it expires between being read and being
+          verified, which is common right after a page load or a resumed
+          session. 401 is not in the retryable-status list below, so this
+          surfaced as "Invalid Privy access token" and stranded the merchant on
+          the setup screen until they pressed Retry. Pressing Retry only worked
+          because it fetched a fresh token, so do exactly that here, once,
+          without making them click anything.
+        */
+        if (res.status === 401) {
+          const body = await res.clone().json().catch(() => null);
+          if (body?.code === "PRIVY_TOKEN_INVALID") {
+            const refreshedToken = await getAccessToken().catch(() => null);
+            if (controller.signal.aborted) return;
+            if (refreshedToken) {
+              headers["Authorization"] = `Bearer ${refreshedToken}`;
+              res = await registerMerchant();
+              if (controller.signal.aborted) return;
+            }
+          }
+        }
+
         if (!res.ok) {
           let body = await res.json().catch(() => null);
           // PRIVY_WALLET_MISMATCH is deliberately absent. That code means Privy

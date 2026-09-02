@@ -2508,12 +2508,9 @@ export default function Home() {
       wallet URI is what makes scan-and-pay work in OKX or MetaMask.
     */
     /*
-      No per-token exceptions: Customer Pays set means the wallet URI with the
-      preset amount, always — the owner's explicit rule. Some wallet scanners
-      refuse tokens outside their own catalogs ("No MYRT added to your
-      wallet"); that gate is inside the wallet and, by decision, we do not
-      route around it here. walletScanPayable still arrives from the server
-      for any future per-wallet deeplink work.
+      Customer Pays set -> the wallet URI with the preset amount, always — the
+      owner's rule, no per-token routing. walletScanPayable still arrives from
+      the server for future per-wallet work.
     */
     const activeQrValue = isConversionMode
       ? buildPaymentQrValue({

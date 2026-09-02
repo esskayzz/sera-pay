@@ -1133,6 +1133,24 @@ export default function PayPage() {
     } catch {}
   }, [login]);
 
+  /*
+    Express pay: a QR scanned by a wallet's own scanner opens this page inside
+    that wallet's browser, with the pay token and amount preset by the
+    merchant. In that context the connect tap is pure friction — the provider
+    is injected and there is exactly one wallet it can be — so trigger the
+    wallet connect immediately. One attempt only: if the customer dismisses
+    it, the normal buttons are right there and nothing loops.
+  */
+  const expressConnectTriedRef = useRef(false);
+  useEffect(() => {
+    if (phase !== "connect" || !ready || authenticated) return;
+    if (expressConnectTriedRef.current) return;
+    const injected = typeof window !== "undefined" && (window as any).ethereum;
+    if (!injected || !req?.payCoin) return;
+    expressConnectTriedRef.current = true;
+    openPrivyLogin(["wallet"]);
+  }, [phase, ready, authenticated, req?.payCoin, openPrivyLogin]);
+
   const handleConnectWallet = useCallback(() => openPrivyLogin(["wallet"]), [openPrivyLogin]);
   const handleSeraLogin = useCallback(() => openPrivyLogin(["email", "google", "twitter"]), [openPrivyLogin]);
   const handleCopyMerchantAddress = useCallback(async () => {
