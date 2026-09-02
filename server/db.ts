@@ -820,6 +820,15 @@ function toPgMenuOrderColumns(data: InsertMenuOrder): Record<string, unknown> {
   return mapped;
 }
 
+export async function getMenuOrderById(id: string): Promise<MenuOrder | undefined> {
+  const pgPool = await getPostgresPool();
+  if (pgPool) return pgSelectOne<MenuOrder>(pgPool, "menu_orders", `"id" = $1`, [id]);
+  const db = await getDb();
+  if (!db) return memory.menuOrders.get(id);
+  const result = await db.select().from(menuOrders).where(eq(menuOrders.id, id)).limit(1);
+  return result[0];
+}
+
 export async function createMenuOrder(data: InsertMenuOrder): Promise<void> {
   const pgPool = await getPostgresPool();
   if (pgPool) { await pgInsert(pgPool, "menu_orders", toPgMenuOrderColumns(data)); return; }

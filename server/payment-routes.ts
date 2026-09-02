@@ -28,6 +28,8 @@ import {
   listSubWallets,
   getSubWalletByAddress,
   getApiKeyConfigRecord,
+  getPaymentIntentById,
+  getMenuOrderById,
   updatePaymentIntent,
   updateMenuOrderPayment,
 } from "./db";
@@ -37,6 +39,7 @@ import { PrivyAuthError, assertPrivyWalletOwnership, getPrivyWalletSummary, send
 import { isR2StorageConfigured, storagePut, storageRead } from "./storage";
 import { decryptSecret } from "./secret-vault";
 import { hashSeraIntentStruct, SERA_INTENT_TYPES, type SeraIntentMessage } from "./sera-intent";
+import { PaymentBindingError, assertAmountMatchesReference, assertMenuOrderBindable, assertPaymentIntentBindable } from "./payment-binding";
 import {
   DEFAULT_SERA_API_BASE_URL,
   DEFAULT_SERA_API_TESTNET_BASE_URL,
@@ -1402,6 +1405,48 @@ function isSeraSwapTransaction(tx: Transaction): boolean {
   }
 }
 
+/**
+ * When the payment names what it is for (a payment intent or a menu order),
+ * the stored record is authoritative: this re-verifies ownership, life-cycle
+ * state and currency on the server and returns the amount the payment must
+ * cover. Without it, a checkout link could be re-encoded with a smaller
+ * amount, paid, and still fulfil the order.
+ */
+async function resolvePayableReferenceAmount({
+  merchant,
+  receiveCoin,
+  paymentIntentId,
+  orderId,
+}: {
+  merchant: Merchant;
+  receiveCoin: string;
+  paymentIntentId: string | null;
+  orderId: string | null;
+}): Promise<{ amount: string; label: string } | null> {
+  if (!paymentIntentId && !orderId) return null;
+  const references: Array<{ amount: string; label: string }> = [];
+  if (paymentIntentId) {
+    const intent = await getPaymentIntentById(paymentIntentId);
+    references.push({
+      amount: assertPaymentIntentBindable(intent, { merchantId: merchant.id, receiveCoin }),
+      label: "payment intent",
+    });
+  }
+  if (orderId) {
+    const order = await getMenuOrderById(orderId);
+    references.push({
+      amount: assertMenuOrderBindable(order, {
+        merchantId: merchant.id,
+        receiveCoin,
+        merchantReceiveCoin: merchant.receiveCoin,
+      }),
+      label: "menu order",
+    });
+  }
+  // When both are named, the larger amount is the one that has to be covered.
+  return references.sort((a, b) => Number(b.amount) - Number(a.amount))[0] ?? null;
+}
+
 /** POST /api/payment/create — create a pending payment request */
 paymentRouter.post("/payment/create", async (req, res) => {
   try {
@@ -1434,6 +1479,12 @@ paymentRouter.post("/payment/create", async (req, res) => {
       res.status(404).json({ error: "Merchant not found" }); return;
     }
     const { merchant, toAddress } = resolved;
+    const payableReference = await resolvePayableReferenceAmount({
+      merchant,
+      receiveCoin: coinSymbol,
+      paymentIntentId,
+      orderId,
+    });
     const id = uuidv4();
     const toAddressCompliance = await screenWalletAddress(toAddress, "recipient_wallet", merchant.id);
     if (toAddressCompliance.blocked) {
@@ -1448,6 +1499,9 @@ paymentRouter.post("/payment/create", async (req, res) => {
     } catch (error) {
       res.status(400).json({ error: error instanceof Error ? error.message : "Unsupported coin on this network" });
       return;
+    }
+    if (payableReference) {
+      assertAmountMatchesReference(normalizedAmount, payableReference.amount, { exact: true, label: payableReference.label });
     }
     await createTransaction({
       id,
@@ -1481,7 +1535,10 @@ paymentRouter.post("/payment/create", async (req, res) => {
       tokenAddress: paymentToken.address,
       tokenDecimals: paymentToken.decimals,
     });
-  } catch (e) { logSeraOperationFailure("payment-route", e); res.status(500).json({ error: "Internal server error" }); }
+  } catch (e) {
+    if (e instanceof PaymentBindingError) { res.status(e.status).json({ error: e.message }); return; }
+    logSeraOperationFailure("payment-route", e); res.status(500).json({ error: "Internal server error" });
+  }
 });
 
 /** POST /api/payment/swap/quote - Sera quote for customer coin -> merchant receive coin */
@@ -1523,6 +1580,12 @@ paymentRouter.post("/payment/swap/quote", async (req, res) => {
       res.status(403).json({ error: "Recipient address failed compliance screening", compliance: recipientCompliance });
       return;
     }
+    const payableReference = await resolvePayableReferenceAmount({
+      merchant,
+      receiveCoin,
+      paymentIntentId,
+      orderId,
+    });
 
     const baseUrl = getSeraApiBaseUrlForChain(chainId);
     const [fromToken, toToken, config, seraNowSec] = await Promise.all([
@@ -1630,6 +1693,9 @@ paymentRouter.post("/payment/swap/quote", async (req, res) => {
     // settlement reconciliation.
     const intentHash = hashSeraIntentStruct(routeParams);
     const expectedReceiveAmount = requestedReceiveAmount ?? fromRawTokenAmount(routeParams.minOutputAmount, toToken.decimals);
+    if (payableReference) {
+      assertAmountMatchesReference(expectedReceiveAmount, payableReference.amount, { exact: false, label: payableReference.label });
+    }
     const maximumPayAmount = fromRawTokenAmount(routeParams.maxInputAmount, fromToken.decimals);
     const approval = getPermitApproval(quote.permit, routeParams.maxInputAmount);
     if (approval && (!config.sor_address || approval.spender.toLowerCase() !== config.sor_address.toLowerCase())) {
@@ -1724,6 +1790,7 @@ paymentRouter.post("/payment/swap/quote", async (req, res) => {
       },
     });
   } catch (e: any) {
+    if (e instanceof PaymentBindingError) { res.status(e.status).json({ error: e.message }); return; }
     logSeraOperationFailure("payment/swap/quote", e);
     const response = seraPaymentErrorResponse(e, "Unable to create Sera swap quote");
     res.status(response.status).json(response.body);
