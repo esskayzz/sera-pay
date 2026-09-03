@@ -8,7 +8,7 @@ import { useEvents } from "@/hooks/use-events";
 import { motion, AnimatePresence } from "framer-motion";
 import { SeraLogo } from "@/components/SeraPayHeader";
 import { NetworkModeButton, NetworkSwitcherModal, useActiveNetworkMode } from "@/components/NetworkSwitcher";
-import { buildPaymentQrValue, buildPaymentUrl, LIVE_PAYMENT_CHAIN_ID, seraRateErrorMessage, TEST_PAYMENT_CHAIN_ID } from "@/lib/payment";
+import { buildPaymentQrValue, requestSignedPaymentUrl, LIVE_PAYMENT_CHAIN_ID, seraRateErrorMessage, TEST_PAYMENT_CHAIN_ID } from "@/lib/payment";
 import { loadSeraCurrencies, type SeraCurrency } from "@/lib/currencyCalculator";
 import { QRStyled, QR_STYLES, type QrMode, type QrStyle } from "@/components/QRStyled";
 import { formatDecimalAmount, limitDecimalPlaces, normalizeDecimalAmountText } from "@/lib/decimalInput";
@@ -233,7 +233,10 @@ function DashboardPaymentModal({
     const duration = getDashboardExpiryMs(expiryOption);
     return duration > 0 ? expiryNow + duration : undefined;
   }, [expiryNow, expiryOption]);
-  const paymentUrl = React.useMemo(() => receiverAddress && conversionReady ? buildPaymentUrl({
+  // The checkout link is signed server-side, so it is fetched rather than
+  // encoded locally. The effect re-signs whenever the request actually changes;
+  // a signing failure renders as "no link" instead of an unsigned one.
+  const paymentUrlRequest = React.useMemo(() => ({
     receiverAddress,
     receiveCoin: resolvedReceiveCoin,
     amount: receiveAmount || undefined,
@@ -245,7 +248,16 @@ function DashboardPaymentModal({
     description: description.trim() || undefined,
     expiresAt,
     singleUse: singleUse || undefined,
-  }) : "", [chainId, conversionReady, description, displayPayAmount, expiresAt, logo, merchantName, receiveAmount, receiverAddress, resolvedPayCoin, resolvedReceiveCoin, singleUse]);
+  }), [chainId, description, displayPayAmount, expiresAt, logo, merchantName, receiveAmount, receiverAddress, resolvedPayCoin, resolvedReceiveCoin, singleUse]);
+  const [paymentUrl, setPaymentUrl] = React.useState("");
+  React.useEffect(() => {
+    if (!receiverAddress || !conversionReady) { setPaymentUrl(""); return; }
+    let cancelled = false;
+    requestSignedPaymentUrl(paymentUrlRequest)
+      .then((url) => { if (!cancelled) setPaymentUrl(url); })
+      .catch(() => { if (!cancelled) setPaymentUrl(""); });
+    return () => { cancelled = true; };
+  }, [paymentUrlRequest, conversionReady, receiverAddress]);
   const paymentQrValue = React.useMemo(() => receiverAddress && paymentUrl ? buildPaymentQrValue({
     receiverAddress,
     coin: resolvedPayCoin,

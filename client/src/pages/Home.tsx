@@ -4,7 +4,7 @@ import jsQR from "jsqr";
 import { useLocation } from "wouter";
 import { useChainId } from "wagmi";
 import { type Stablecoin } from "@/lib/stablecoins";
-import { buildPaymentQrValue, buildPaymentUrl, LIVE_PAYMENT_CHAIN_ID, resolvePaymentChainId, seraRateErrorMessage } from "@/lib/payment";
+import { buildPaymentQrValue, requestSignedPaymentUrl, LIVE_PAYMENT_CHAIN_ID, resolvePaymentChainId, seraRateErrorMessage } from "@/lib/payment";
 import { applyConversionMinimum, conversionMinimumMessage, getConversionMinimum, isBelowConversionMinimum, loadSeraCurrencies, type SeraCurrency } from "@/lib/currencyCalculator";
 import { buildClientAppUrl, getClientAppPath } from "@/lib/app-url";
 import { QRStyled, QR_STYLES, type QrMode, type QrStyle } from "@/components/QRStyled";
@@ -1788,14 +1788,22 @@ function TransactionHistory({ apiKey, chainId }: { apiKey: string; chainId: numb
     }
   }, [apiKey, chainId, notifyPayment]);
 
-  const openPendingPayment = (tx: any) => {
+  const openPendingPayment = async (tx: any) => {
     if (tx.status !== "pending" && tx.status !== "confirming") return;
-    const url = tx.paymentUrl || (tx.toAddress ? buildPaymentUrl({
-      receiverAddress: tx.toAddress,
-      receiveCoin: tx.coin,
-      amount: tx.amount,
-      chainId: tx.chainId || chainId,
-    }) : "");
+    // Re-mint a signed link even when a stored URL exists: legacy rows carry
+    // unsigned checkout URLs that today's checkout refuses to render.
+    let url = "";
+    if (tx.toAddress) {
+      try {
+        url = await requestSignedPaymentUrl({
+          receiverAddress: tx.toAddress,
+          receiveCoin: tx.coin,
+          amount: tx.amount,
+          chainId: tx.chainId || chainId,
+        });
+      } catch {}
+    }
+    if (!url) url = tx.paymentUrl || "";
     if (url) window.location.href = url;
   };
 
@@ -2326,7 +2334,9 @@ export default function Home() {
     return undefined;
   }, [expiryOption]);
 
-  const createPaymentUrl = useCallback((overrides: {
+  // Checkout links are signed server-side, so minting is a network call. An
+  // invalid request still resolves to "" so callers' empty-string guards hold.
+  const createPaymentUrl = useCallback(async (overrides: {
     receiveCoin?: Stablecoin | null;
     receiveAmount?: string;
     payCoin?: Stablecoin | null;
@@ -2342,18 +2352,22 @@ export default function Home() {
     const payAmount = overrides.payAmount ?? customerAmount;
     const includeExpiry = overrides.includeExpiry ?? true;
 
-    return buildPaymentUrl({
-      receiverAddress: receiveAddress,
-      receiveCoin: receiveCoin.symbol,
-      chainId: paymentChainId,
-      amount: receiveAmount || undefined,
-      payCoin: payCoin?.symbol || undefined,
-      payAmount: payAmount || undefined,
-      merchantName: merchantName || undefined,
-      description: description.trim() || undefined,
-      expiresAt: includeExpiry ? getExpiresAt() : undefined,
-      singleUse: includeExpiry ? singleUse || undefined : undefined,
-    });
+    try {
+      return await requestSignedPaymentUrl({
+        receiverAddress: receiveAddress,
+        receiveCoin: receiveCoin.symbol,
+        chainId: paymentChainId,
+        amount: receiveAmount || undefined,
+        payCoin: payCoin?.symbol || undefined,
+        payAmount: payAmount || undefined,
+        merchantName: merchantName || undefined,
+        description: description.trim() || undefined,
+        expiresAt: includeExpiry ? getExpiresAt() : undefined,
+        singleUse: includeExpiry ? singleUse || undefined : undefined,
+      });
+    } catch {
+      return "";
+    }
   }, [selectedCoin, receiverAddress, amount, customerCoin, customerAmount, merchantName, description, getExpiresAt, singleUse, paymentChainId]);
 
   const handleSwapCoins = useCallback(() => {
@@ -2380,8 +2394,9 @@ export default function Home() {
     setLastEdited("receive");
 
     if (step === 2) {
-      const directPaymentUrl = createPaymentUrl({ payCoin: null, payAmount: "" });
-      if (directPaymentUrl) setPaymentUrl(directPaymentUrl);
+      void createPaymentUrl({ payCoin: null, payAmount: "" }).then((directPaymentUrl) => {
+        if (directPaymentUrl) setPaymentUrl(directPaymentUrl);
+      });
     }
   }, [createPaymentUrl, step]);
 
@@ -2408,13 +2423,14 @@ export default function Home() {
       setShowGuestReceiverModal(true);
       return;
     }
-    const url = createPaymentUrl();
-    if (!url) return;
-    clearPendingRequest();
-    pendingRequestRef.current = null;
-    pendingResumeRef.current = false;
-    setPaymentUrl(url);
-    setStep(2);
+    void createPaymentUrl().then((url) => {
+      if (!url) return;
+      clearPendingRequest();
+      pendingRequestRef.current = null;
+      pendingResumeRef.current = false;
+      setPaymentUrl(url);
+      setStep(2);
+    });
   }, [createPaymentUrl, customerAmount, customerCoin, exchangeRate, receiverAddress, selectedCoin]);
 
   /**
@@ -2445,10 +2461,11 @@ export default function Home() {
     setGuestReceiverAddress(nextAddress);
     setShowGuestReceiverModal(false);
     cancelPendingQrIntent();
-    const url = createPaymentUrl({ receiverAddress: nextAddress });
-    if (!url) return;
-    setPaymentUrl(url);
-    setStep(2);
+    void createPaymentUrl({ receiverAddress: nextAddress }).then((url) => {
+      if (!url) return;
+      setPaymentUrl(url);
+      setStep(2);
+    });
   }, [createPaymentUrl, selectedCoin, cancelPendingQrIntent]);
 
   const handleCopyLink = useCallback(async () => {
@@ -2841,8 +2858,9 @@ export default function Home() {
       setAmount(nextReceiveAmount);
       if (customerCoin) setCustomerAmount(nextPayAmount);
       // Rebuild payment URL
-      const newUrl = createPaymentUrl({ receiveAmount: nextReceiveAmount, payAmount: nextPayAmount });
-      setPaymentUrl(newUrl);
+      void createPaymentUrl({ receiveAmount: nextReceiveAmount, payAmount: nextPayAmount }).then((newUrl) => {
+        setPaymentUrl(newUrl);
+      });
       closeQrEdit();
     };
 
@@ -2860,8 +2878,9 @@ export default function Home() {
         setCustomerCoin(coin);
         setCustomerAmount(sameAmount);
         setExchangeRate(1);
-        const newUrl = createPaymentUrl({ payCoin: coin, payAmount: sameAmount });
-        setPaymentUrl(newUrl);
+        void createPaymentUrl({ payCoin: coin, payAmount: sameAmount }).then((newUrl) => {
+          setPaymentUrl(newUrl);
+        });
         return;
       }
       setQrRateLoading(true);
@@ -2888,8 +2907,9 @@ export default function Home() {
             setCustomerCoin(coin);
             setExchangeRate(data.rate);
             setCustomerAmount(newPayAmount);
-            const newUrl = createPaymentUrl({ receiveAmount: newReceiveAmount, payCoin: coin, payAmount: newPayAmount });
-            setPaymentUrl(newUrl);
+            void createPaymentUrl({ receiveAmount: newReceiveAmount, payCoin: coin, payAmount: newPayAmount }).then((newUrl) => {
+              setPaymentUrl(newUrl);
+            });
           } else {
             throw new Error("Sera did not return an exchange rate");
           }
@@ -3312,8 +3332,9 @@ export default function Home() {
               if (!customerCoin) {
                 setQrRateLoading(false);
                 setSelectedCoin(coin);
-                const newUrl = createPaymentUrl({ receiveCoin: coin, receiveAmount, payCoin: null, payAmount: "" });
-                if (newUrl) setPaymentUrl(newUrl);
+                void createPaymentUrl({ receiveCoin: coin, receiveAmount, payCoin: null, payAmount: "" }).then((newUrl) => {
+                  if (newUrl) setPaymentUrl(newUrl);
+                });
                 return;
               }
               // As with the pay-coin picker, keep the last valid QR active
@@ -3334,13 +3355,12 @@ export default function Home() {
                       setSelectedCoin(coin);
                       setExchangeRate(data.rate);
                       setCustomerAmount(newPayAmount);
-                      const newUrl = createPaymentUrl({
+                      void createPaymentUrl({
                         receiveCoin: coin,
                         receiveAmount,
                         payCoin: customerCoin,
                         payAmount: newPayAmount,
-                      });
-                      setPaymentUrl(newUrl);
+                      }).then(setPaymentUrl);
                     } else {
                       throw new Error("Sera did not return an exchange rate");
                     }
@@ -3359,13 +3379,12 @@ export default function Home() {
                 setSelectedCoin(coin);
                 setExchangeRate(1);
                 setCustomerAmount(receiveAmount);
-                const newUrl = createPaymentUrl({
+                void createPaymentUrl({
                   receiveCoin: coin,
                   receiveAmount,
                   payCoin: coin,
                   payAmount: receiveAmount,
-                });
-                setPaymentUrl(newUrl);
+                }).then(setPaymentUrl);
               }
             }}
             selectedSymbol={selectedCoin?.symbol}

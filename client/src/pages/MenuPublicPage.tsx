@@ -627,7 +627,10 @@ export default function MenuPublicPage() {
         receiveCoin,
         paymentChainId,
       );
-      const url = buildPaymentUrl({
+      // Prefer the checkout the server signed from the stored order. The
+      // local build below only covers an older server that predates signed
+      // checkouts — its product is refused by the checkout page, never paid.
+      const url = order?.checkout?.paymentUrl || buildPaymentUrl({
         receiverAddress: merchant.walletAddress,
         receiveCoin,
         amount: receiveAmount,
@@ -641,6 +644,7 @@ export default function MenuPublicPage() {
         orderId: order.id,
         description: `Order: ${cart.map(e => `${e.qty}× ${e.item.name}`).join(", ")}`,
       });
+      if (!url) throw new Error("Unable to create a checkout for this order. Please try again.");
       navigate(getClientAppPath(url));
     } catch (e: any) {
       alert(e.message || "Unable to create order");

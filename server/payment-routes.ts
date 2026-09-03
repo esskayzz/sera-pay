@@ -41,6 +41,7 @@ import { decryptSecret } from "./secret-vault";
 import { notePairResult } from "./pair-liquidity";
 import { hashSeraIntentStruct, SERA_INTENT_TYPES, type SeraIntentMessage } from "./sera-intent";
 import { PaymentBindingError, assertAmountMatchesReference, assertMenuOrderBindable, assertPaymentIntentBindable } from "./payment-binding";
+import { CheckoutPayloadError, isCheckoutSigningReady, signCheckoutPayload, verifyCheckoutPayload } from "./checkout-payload";
 import {
   DEFAULT_SERA_API_BASE_URL,
   DEFAULT_SERA_API_TESTNET_BASE_URL,
@@ -1454,12 +1455,133 @@ async function resolvePayableReferenceAmount({
   return references.sort((a, b) => Number(b.amount) - Number(a.amount))[0] ?? null;
 }
 
+/**
+ * Verifies the signed checkout segment a /pay checkout sends back with its
+ * payment calls. When present, the payload's receiver, currency and amount
+ * override whatever the request body says — the signed link, not the browser
+ * body, decides where money moves. Returns null when no payload was sent;
+ * throws CheckoutPayloadError (400) on anything unsigned or tampered.
+ */
+function bindCheckoutRequest(raw: unknown): Record<string, any> | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (typeof raw !== "string") throw new CheckoutPayloadError("Invalid checkout payload");
+  const request = verifyCheckoutPayload(raw.trim());
+  if (!request) {
+    throw new CheckoutPayloadError("This checkout link failed verification. Ask the merchant for a fresh link.");
+  }
+  if (!/^0x[0-9a-fA-F]{40}$/.test(String(request.receiverAddress || ""))) {
+    throw new CheckoutPayloadError("Checkout link has an invalid receiver address");
+  }
+  if (!COIN_SYMBOL_RE.test(String(request.receiveCoin || ""))) {
+    throw new CheckoutPayloadError("Checkout link has an invalid currency");
+  }
+  return request;
+}
+
+function getPublicBaseUrl(req: Request): string {
+  if (ENV.paymentBaseUrl) return ENV.paymentBaseUrl.replace(/\/+$/, "");
+  return `${req.protocol}://${req.get("host")}`;
+}
+
+/**
+ * Clamps a dashboard checkout request down to the fields a signed payload may
+ * carry. Amounts must survive normalizeDecimalAmount; anything unrecognized is
+ * dropped rather than signed blind. Testnet is only signable when the server
+ * enabled it.
+ */
+function sanitizeCheckoutRequest(input: any): Record<string, unknown> | null {
+  if (!input || typeof input !== "object") return null;
+  const receiverAddress = String(input.receiverAddress ?? "").toLowerCase();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(receiverAddress)) return null;
+  const receiveCoin = String(input.receiveCoin ?? "").trim().toUpperCase();
+  if (!COIN_SYMBOL_RE.test(receiveCoin)) return null;
+
+  const payload: Record<string, unknown> = { receiverAddress, receiveCoin };
+  try {
+    if (input.amount !== undefined && input.amount !== null && input.amount !== "") {
+      payload.amount = normalizeDecimalAmount(input.amount);
+    }
+    if (input.payAmount !== undefined && input.payAmount !== null && input.payAmount !== "") {
+      payload.payAmount = normalizeDecimalAmount(input.payAmount);
+    }
+  } catch {
+    return null;
+  }
+  const chainId = Number(input.chainId ?? SERA_MAINNET_CHAIN_ID);
+  if (chainId !== SERA_MAINNET_CHAIN_ID && !isTestnetChainEnabled(chainId)) return null;
+  payload.chainId = chainId;
+
+  if (typeof input.description === "string" && input.description.trim()) payload.description = input.description.trim().slice(0, 300);
+  if (typeof input.merchantName === "string" && input.merchantName.trim()) payload.merchantName = input.merchantName.trim().slice(0, 120);
+  if (typeof input.merchantIcon === "string" && input.merchantIcon.length <= 4096) payload.merchantIcon = input.merchantIcon;
+  const expiresAt = Number(input.expiresAt);
+  if (Number.isFinite(expiresAt) && expiresAt > Date.now()) payload.expiresAt = expiresAt;
+  if (input.singleUse === true) payload.singleUse = true;
+
+  for (const key of ["paymentIntentId", "orderId", "menuName", "menuSlug"] as const) {
+    const value = input[key];
+    if (typeof value === "string" && value.trim()) payload[key] = value.trim().slice(0, 120);
+  }
+  if (Array.isArray(input.orderItems)) {
+    const items = input.orderItems.slice(0, 80).map((item: any) => ({
+      id: String(item?.id ?? "").slice(0, 64),
+      n: String(item?.n ?? "").slice(0, 200),
+      p: String(item?.p ?? "").slice(0, 32),
+      q: Math.max(0, Math.min(99, Number.parseInt(String(item?.q ?? 0), 10) || 0)),
+      ...(item?.c ? { c: String(item.c).trim().slice(0, 20).toUpperCase() } : {}),
+    })).filter((item: any) => item.id && item.n && item.q > 0);
+    if (items.length > 0) payload.orderItems = items;
+  }
+
+  payload._n = crypto.randomBytes(4).toString("hex");
+  return payload;
+}
+
+/** POST /api/payment/checkout/sign — mint a signed checkout link for this merchant */
+paymentRouter.post("/payment/checkout/sign", requireApiKey as any, async (req: any, res) => {
+  try {
+    if (!isCheckoutSigningReady()) {
+      res.status(503).json({ error: "Checkout link signing is unavailable (SESSION_SECRET is not configured)" });
+      return;
+    }
+    const payload = sanitizeCheckoutRequest(req.body?.request ?? req.body);
+    if (!payload) {
+      res.status(400).json({ error: "Invalid checkout request" });
+      return;
+    }
+    const receiver = String(payload.receiverAddress);
+    const subWallets = await listSubWallets(req.merchant.id);
+    const owned = [req.merchant.walletAddress, req.merchant.storeAddress, ...subWallets
+      .filter((wallet) => wallet.status === "active")
+      .map((wallet) => wallet.address)]
+      .some((address) => String(address || "").toLowerCase() === receiver);
+    if (!owned) {
+      res.status(403).json({ error: "Receiver address does not belong to this merchant" });
+      return;
+    }
+    const encoded = signCheckoutPayload(payload);
+    res.json({ encoded, paymentUrl: `${getPublicBaseUrl(req)}/pay/${encoded}` });
+  } catch (e) {
+    if (e instanceof CheckoutPayloadError) { res.status(e.status).json({ error: e.message }); return; }
+    logSeraOperationFailure("payment/checkout/sign", e);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 /** POST /api/payment/create — create a pending payment request */
 paymentRouter.post("/payment/create", async (req, res) => {
   try {
-    const { merchantAddress, coin, amount, chainId } = req.body;
-    const orderId = typeof req.body.orderId === "string" ? req.body.orderId : null;
-    const paymentIntentId = typeof req.body.paymentIntentId === "string" ? req.body.paymentIntentId : null;
+    const checkoutRequest = bindCheckoutRequest(req.body.checkoutPayload);
+    const merchantAddress = String(checkoutRequest?.receiverAddress ?? req.body.merchantAddress ?? "");
+    const coin = String(checkoutRequest?.receiveCoin ?? req.body.coin ?? "");
+    const amount = checkoutRequest?.amount ?? req.body.amount;
+    const chainId = checkoutRequest ? checkoutRequest.chainId : req.body.chainId;
+    const orderId = typeof (checkoutRequest?.orderId ?? req.body.orderId) === "string"
+      ? String(checkoutRequest?.orderId ?? req.body.orderId)
+      : null;
+    const paymentIntentId = typeof (checkoutRequest?.paymentIntentId ?? req.body.paymentIntentId) === "string"
+      ? String(checkoutRequest?.paymentIntentId ?? req.body.paymentIntentId)
+      : null;
     const paymentUrl = typeof req.body.paymentUrl === "string" && req.body.paymentUrl.length <= 4096 ? req.body.paymentUrl : null;
     if (!merchantAddress || !/^0x[0-9a-fA-F]{40}$/.test(merchantAddress)) { res.status(400).json({ error: "Invalid merchantAddress" }); return; }
     const coinSymbol = String(coin || "").trim().toUpperCase();
@@ -1544,6 +1666,7 @@ paymentRouter.post("/payment/create", async (req, res) => {
     });
   } catch (e) {
     if (e instanceof PaymentBindingError) { res.status(e.status).json({ error: e.message }); return; }
+    if (e instanceof CheckoutPayloadError) { res.status(e.status).json({ error: e.message }); return; }
     logSeraOperationFailure("payment-route", e); res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -1551,23 +1674,35 @@ paymentRouter.post("/payment/create", async (req, res) => {
 /** POST /api/payment/swap/quote - Sera quote for customer coin -> merchant receive coin */
 paymentRouter.post("/payment/swap/quote", async (req, res) => {
   try {
-    const merchantAddress = String(req.body.merchantAddress ?? "").trim();
+    const checkoutRequest = bindCheckoutRequest(req.body.checkoutPayload);
+    const merchantAddress = String(checkoutRequest?.receiverAddress ?? req.body.merchantAddress ?? "").trim();
     const payerAddress = String(req.body.payerAddress ?? "").trim().toLowerCase();
     const payCoin = String(req.body.payCoin ?? "").trim().toUpperCase();
-    const receiveCoin = String(req.body.receiveCoin ?? "").trim().toUpperCase();
+    const receiveCoin = String(checkoutRequest?.receiveCoin ?? req.body.receiveCoin ?? "").trim().toUpperCase();
     let payAmount = "";
     let requestedReceiveAmount: string | null = null;
     try {
       payAmount = normalizeDecimalAmount(req.body.payAmount);
-      requestedReceiveAmount = req.body.receiveAmount ? normalizeDecimalAmount(req.body.receiveAmount) : null;
+      // A signed checkout fixes what the merchant receives; the body only
+      // supplies a receive amount for open-amount checkouts.
+      const checkoutAmount = typeof checkoutRequest?.amount === "string" ? checkoutRequest.amount : "";
+      requestedReceiveAmount = checkoutAmount
+        ? normalizeDecimalAmount(checkoutAmount)
+        : req.body.receiveAmount
+          ? normalizeDecimalAmount(req.body.receiveAmount)
+          : null;
     } catch (error: any) {
       res.status(400).json({ error: error?.message || "Invalid amount" });
       return;
     }
-    const requestedChainId = Number(req.body.chainId ?? 1);
+    const requestedChainId = Number(checkoutRequest ? checkoutRequest.chainId : (req.body.chainId ?? 1));
     const chainId = Number.isInteger(requestedChainId) && requestedChainId > 0 ? requestedChainId : 1;
-    const paymentIntentId = typeof req.body.paymentIntentId === "string" ? req.body.paymentIntentId : null;
-    const orderId = typeof req.body.orderId === "string" ? req.body.orderId : null;
+    const paymentIntentId = typeof (checkoutRequest?.paymentIntentId ?? req.body.paymentIntentId) === "string"
+      ? String(checkoutRequest?.paymentIntentId ?? req.body.paymentIntentId)
+      : null;
+    const orderId = typeof (checkoutRequest?.orderId ?? req.body.orderId) === "string"
+      ? String(checkoutRequest?.orderId ?? req.body.orderId)
+      : null;
     const requestedExpiration = Number(req.body.expiration);
 
     if (!/^0x[0-9a-fA-F]{40}$/.test(merchantAddress)) { res.status(400).json({ error: "Invalid merchantAddress" }); return; }
@@ -1798,6 +1933,7 @@ paymentRouter.post("/payment/swap/quote", async (req, res) => {
     });
   } catch (e: any) {
     if (e instanceof PaymentBindingError) { res.status(e.status).json({ error: e.message }); return; }
+    if (e instanceof CheckoutPayloadError) { res.status(e.status).json({ error: e.message }); return; }
     logSeraOperationFailure("payment/swap/quote", e);
     const response = seraPaymentErrorResponse(e, "Unable to create Sera swap quote");
     res.status(response.status).json(response.body);

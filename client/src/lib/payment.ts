@@ -1,5 +1,6 @@
 import { buildClientAppUrl } from "@/lib/app-url";
 import { normalizeDecimalAmountText } from "@/lib/decimalInput";
+import { fetchApi } from "@/lib/api";
 import type { SeraApiMode } from "@shared/gateway";
 
 export const LIVE_PAYMENT_CHAIN_ID = 1;
@@ -161,6 +162,49 @@ export function decodePaymentRequest(encoded: string): PaymentRequest | null {
   } catch {
     return null;
   }
+}
+
+export interface DecodedCheckout {
+  request: PaymentRequest;
+  /**
+   * Whether the link segment carries a server signature. The browser cannot
+   * verify the HMAC (the key never leaves the server) — it only sees whether
+   * one is present. The server performs the real verification when the
+   * checkout pays, and the checkout refuses to render unsigned links.
+   */
+  signed: boolean;
+}
+
+/**
+ * Splits a `/pay/:encoded` segment into the request and its signature part.
+ * A signed segment is `<base64url body>.<base64url signature>`; base64url
+ * never contains a dot, so the last dot is an unambiguous separator.
+ */
+export function decodeCheckoutPayload(encoded: string): DecodedCheckout | null {
+  if (!encoded) return null;
+  const separator = encoded.lastIndexOf(".");
+  if (separator <= 0) {
+    const request = decodePaymentRequest(encoded);
+    return request ? { request, signed: false } : null;
+  }
+  const body = encoded.slice(0, separator);
+  const signature = encoded.slice(separator + 1);
+  const request = decodePaymentRequest(body);
+  if (!request) return null;
+  return { request, signed: /^[A-Za-z0-9_-]{43,}$/.test(signature) };
+}
+
+/**
+ * Asks the server to sign a checkout payload for the signed-in merchant.
+ * The server validates the receiver belongs to the merchant, clamps every
+ * field, and returns the signed `/pay/:payload` segment.
+ */
+export async function requestSignedPaymentUrl(request: PaymentRequest): Promise<string> {
+  const data = await fetchApi<{ encoded?: string; paymentUrl?: string }>("/payment/checkout/sign", {
+    method: "POST",
+    body: JSON.stringify({ request }),
+  });
+  return typeof data.paymentUrl === "string" ? data.paymentUrl : "";
 }
 
 export function buildPaymentUrl(req: PaymentRequest): string {

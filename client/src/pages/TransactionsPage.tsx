@@ -7,7 +7,7 @@ import { useMerchantProfile } from "@/hooks/use-merchant";
 import { formatAmount, getTransactionStatusLabel, shortenAddress } from "@/lib/dashboard-utils";
 import { format, parseISO, startOfDay, endOfDay, startOfMonth, subDays } from "date-fns";
 import { Ban, ExternalLink, Search, X, QrCode, Download, Calendar, ChevronDown, FileText, ChevronRight } from "lucide-react";
-import { buildPaymentUrl, buildWalletPaymentUri } from "@/lib/payment";
+import { requestSignedPaymentUrl, buildWalletPaymentUri } from "@/lib/payment";
 import { useSeraToken } from "@/hooks/use-sera-token";
 import { QRStyled } from "@/components/QRStyled";
 import type { QrStyle } from "@/components/QRStyled";
@@ -639,22 +639,27 @@ export function Transactions() {
 
   const pendingCount = useMemo(() => (data?.transactions ?? []).filter(t => t.status === "pending" || t.status === "confirming").length, [data?.transactions]);
 
-  const getPaymentUrl = (tx: Transaction) => {
-    if (tx.paymentUrl) return tx.paymentUrl;
+  // Re-mint a signed link even when a stored URL exists: legacy rows carry
+  // unsigned checkout URLs that today's checkout refuses to render.
+  const getPaymentUrl = async (tx: Transaction) => {
     const receiverAddress = profile?.storeAddress || profile?.walletAddress;
-    if (!receiverAddress) return "";
-    return buildPaymentUrl({
-      receiverAddress,
-      receiveCoin: tx.coin,
-      amount: tx.amount && parseFloat(tx.amount) > 0 ? tx.amount : undefined,
-      chainId: tx.chainId,
-      merchantName: profile?.name || undefined,
-    });
+    if (!receiverAddress) return tx.paymentUrl || "";
+    try {
+      return await requestSignedPaymentUrl({
+        receiverAddress,
+        receiveCoin: tx.coin,
+        amount: tx.amount && parseFloat(tx.amount) > 0 ? tx.amount : undefined,
+        chainId: tx.chainId,
+        merchantName: profile?.name || undefined,
+      }) || tx.paymentUrl || "";
+    } catch {
+      return tx.paymentUrl || "";
+    }
   };
 
-  const handleShowQR = (tx: Transaction, e: React.MouseEvent) => {
+  const handleShowQR = async (tx: Transaction, e: React.MouseEvent) => {
     e.stopPropagation();
-    const url = getPaymentUrl(tx);
+    const url = await getPaymentUrl(tx);
     if (!url) return;
     setQrTx({
       amount: tx.amount,
@@ -665,9 +670,9 @@ export function Transactions() {
     });
   };
 
-  const handleOpenTransaction = (tx: Transaction) => {
+  const handleOpenTransaction = async (tx: Transaction) => {
     if (tx.status === "pending" || tx.status === "confirming") {
-      const url = getPaymentUrl(tx);
+      const url = await getPaymentUrl(tx);
       if (url) {
         window.location.href = url;
         return;
