@@ -36,6 +36,7 @@ import { ENV } from "./_core/env";
 import { PrivyAuthError, assertPrivyWalletOwnership, getPrivyWalletSummary, sendPrivyAuthError, verifyPrivyRequest, type PrivyIdentity, type PrivyWalletOwnership } from "./_core/privy";
 import { isR2StorageConfigured, storagePut, storageRead } from "./storage";
 import { decryptSecret } from "./secret-vault";
+import { notePairResult } from "./pair-liquidity";
 import { hashSeraIntentStruct, SERA_INTENT_TYPES, type SeraIntentMessage } from "./sera-intent";
 import {
   DEFAULT_SERA_API_BASE_URL,
@@ -179,7 +180,13 @@ export async function requireApiKey(req: Request, res: Response, next: Function)
   } catch (error) {
     // Express 4 does not automatically catch rejected async middleware. A
     // transient database timeout must return an error, not kill the process.
-    console.error("[auth] Unable to validate API key");
+    // Name the cause. This line previously printed nothing but itself, so a
+     // merchant reporting "Unable to validate API key" gave us no way to tell a
+     // pool timeout from a bad connection string. Message only, no stack and no
+     // driver object, since those can carry host and credential details.
+    console.error("[auth] Unable to validate API key", {
+      reason: error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160),
+    });
     if (!res.headersSent) {
       res.status(503).json({ error: "Database is temporarily unavailable. Please retry." });
     }
@@ -3440,6 +3447,41 @@ async function fetchSeraRestFxRateUncached(from: string, to: string, chainId?: n
     }
   }
 
+  /*
+    Sera's reference FX feed, as used by Sera's own swap UI.
+
+    GET /fx/rate on api.sera.cx has been answering 503 for every real pair,
+    which left cross-currency payments unpriceable — while sera.cx itself kept
+    showing live rates for those same pairs. This is where those come from:
+    ECB reference rates (with a commercial feed filling the gaps), covering all
+    22 registry currencies.
+
+    It sits above the swap-quote fallback deliberately. A quote only reports
+    minOutputAmount, so a rate derived from one carries that route's slippage
+    and needs liquidity to exist at all; this is a true mid-market FX rate and
+    needs neither. It stays BELOW /fx/rate so the documented feed wins whenever
+    Sera restores it.
+  */
+  if (/^[A-Z]+$/.test(fromCurrency) && /^[A-Z]+$/.test(toCurrency)) {
+    try {
+      const referenceUrl = `${ENV.seraAppBaseUrl.replace(/\/+$/, "")}/api/rate?from=${encodeURIComponent(fromCurrency)}&to=${encodeURIComponent(toCurrency)}`;
+      const response = await fetch(referenceUrl, { signal: AbortSignal.timeout(8000) });
+      if (response.ok) {
+        const payload = await response.json() as { found?: boolean; rate?: unknown; timestamp?: unknown; source?: unknown };
+        const rate = Number(payload?.rate);
+        if (payload?.found === true && Number.isFinite(rate) && rate > 0) {
+          const asOfSeconds = Number(payload.timestamp);
+          const freshness = Number.isFinite(asOfSeconds) && asOfSeconds > 0 ? asOfSeconds : undefined;
+          rateCache.set(cacheKey, { rate, ts: Date.now(), asOf: freshness });
+          return { rate, source: `sera-fx-reference${payload.source ? `:${payload.source}` : ""}`, asOf: freshness };
+        }
+      }
+    } catch (error) {
+      // Advisory tier: never let it mask the primary feed's own failure.
+      if (!fxFeedError) fxFeedError = error;
+    }
+  }
+
   try {
     const rate = await fetchSeraRate(from, to);
     if (!Number.isFinite(rate) || rate <= 0) {
@@ -3606,6 +3648,8 @@ paymentRouter.get("/rates", async (req, res) => {
     const requestedChainId = Number(req.query.chainId ?? req.query.chain_id ?? 1);
     const chainId = Number.isInteger(requestedChainId) && requestedChainId > 0 ? requestedChainId : 1;
     const { rate, source, asOf } = await fetchSeraRestFxRate(from, to, chainId);
+    // Reality check for the pair tracker: this pair just priced successfully.
+    notePairResult(from, to, true);
     /*
     // Apply SeraPay's 0.5% silent spread — customer pays slightly more than the raw Sera rate.
     // The merchant receives exactly what they requested; SeraPay keeps the difference.
@@ -3636,6 +3680,11 @@ paymentRouter.get("/rates", async (req, res) => {
       res.setHeader("Retry-After", String(Math.ceil(e.retryAfterMs / 1000)));
       res.status(429).json({ error: e.message, errorCode: "sera_rate_limited" });
       return;
+    }
+    if (e instanceof SeraRateUnavailableError && e.errorCode === "no_liquidity") {
+      // Only a liquidity verdict is about the PAIR. An FX outage is global and
+      // must never mark good pairs dead.
+      notePairResult(String(req.query.from ?? ""), String(req.query.to ?? ""), false);
     }
     if (e instanceof SeraRateUnavailableError) {
       // 503 for a Sera-side outage so callers and uptime checks can tell it

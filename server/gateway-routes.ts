@@ -4,6 +4,7 @@ import { ZodError } from "zod";
 import { ENV } from "./_core/env";
 import { verifySeraTokens } from "./token-verify";
 import { getWalletRecognition, getWalletScanPayability } from "./token-recognition";
+import { getPairSnapshot, refreshPairLiquidity } from "./pair-liquidity";
 import {
   createPaymentIntentInputSchema,
   createSubWalletInputSchema,
@@ -298,6 +299,23 @@ gatewayRouter.get("/sera/system", async (req, res) => {
  * currency correctly beats a fresh error that names none.
  */
 const verifiedRegistrySnapshots = new Map<SeraMode, { tokens: Awaited<ReturnType<typeof verifySeraTokens>>["tokens"]; fetchedAt: number }>();
+
+/**
+ * Which pairs the liquidity sweep has managed to price.
+ *
+ * The currency picker already calls this; without the route the request fell
+ * through to the SPA fallback, which answers 200 with index.html, so the fetch
+ * "succeeded", JSON parsing failed, and the catch swallowed it — leaving the
+ * filter permanently empty with nothing logged. Answering honestly costs
+ * nothing: an empty map means "not measured", and the picker is required to
+ * show every token in that case rather than hide any.
+ */
+gatewayRouter.get("/sera/pairs", async (req, res) => {
+  try {
+    refreshPairLiquidity(resolveSeraBaseUrl(querySeraMode(req.query)));
+  } catch { /* advisory only; never fail the request over it */ }
+  res.json(getPairSnapshot());
+});
 
 gatewayRouter.get("/sera/tokens", async (req, res) => {
   const mode = querySeraMode(req.query);

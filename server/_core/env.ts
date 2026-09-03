@@ -19,6 +19,8 @@ export const ENV = {
     nodeEnv: process.env.NODE_ENV,
   }),
   seraApiBaseUrl: env("SERA_API_BASE_URL"),
+  /** Sera's own web app, which serves the reference FX feed its swap UI reads. */
+  seraAppBaseUrl: env("SERA_APP_BASE_URL") || "https://app.sera.cx",
   seraApiTestnetBaseUrl: env("SERA_API_TESTNET_BASE_URL"),
   seraApiKey: env("SERA_API_KEY"),
   // Master switch for Sepolia. Off unless explicitly enabled, so no request

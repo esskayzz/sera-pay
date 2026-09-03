@@ -39,6 +39,31 @@ let _db: any = null;
 let _pgPool: pg.Pool | null = null;
 let _pgSchemaReady = false;
 let _pgUnavailableReason: string | null = null;
+/*
+  When to allow another connection attempt after one failed.
+
+  This used to be a permanent latch: a single failed connect — including a
+  transient one — disabled Postgres for the entire life of the process and
+  silently served every read from the in-memory fallback instead, so merchants
+  and their API keys simply vanished until someone restarted the server. The
+  database sits behind a relayed link, so a blip at start-up is ordinary rather
+  than exceptional. Back off, then try again.
+*/
+let _pgUnavailableUntil = 0;
+const PG_UNAVAILABLE_COOLDOWN_MS = 30_000;
+
+/**
+ * Connection-level failures worth one retry, as opposed to a genuine query or
+ * constraint error. Matched on message because node-postgres surfaces several
+ * of these without a code.
+ */
+function isTransientConnectionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  // "timeout exceeded when trying to connect" is what pg-pool throws when
+  // connectionTimeoutMillis elapses — the single most likely symptom of a
+  // congested link, and the one this list originally missed.
+  return /connection terminated|connection timeout|timeout exceeded|timeout expired|ECONNRESET|ETIMEDOUT|EPIPE|ECONNREFUSED|socket hang up|server closed the connection/i.test(message);
+}
 
 const memory = {
   merchants: new Map<string, Merchant>(),
@@ -348,25 +373,84 @@ async function ensurePostgresSchema(pool: pg.Pool) {
   _pgSchemaReady = true;
 }
 
-async function getPostgresPool() {
-  if (_pgUnavailableReason) return null;
+/*
+  In-flight creation, shared by every caller.
+
+  Creating the pool is not atomic: there is an await on ensurePostgresSchema
+  between building the pool and finishing with it. Without this, a second
+  request arriving in that window saw a non-null _pgPool and used it straight
+  away — before CREATE TABLE had run, and worse, it could hand that pool to
+  drizzle and cache it in _db. If the first caller's setup then failed it called
+  end() on the very pool _db had just captured, and since _db is never
+  reassigned, every write for the rest of the process died on "Cannot use a pool
+  after calling end on the pool" — a message no retry recognises.
+
+  One promise, awaited by everyone, and _pgPool published only once setup has
+  actually succeeded.
+*/
+let _pgPoolPromise: Promise<pg.Pool | null> | null = null;
+
+async function getPostgresPool(): Promise<pg.Pool | null> {
+  if (_pgPool) return _pgPool;
+  if (_pgUnavailableReason && Date.now() < _pgUnavailableUntil) return null;
   if (!process.env.DATABASE_URL || !isPostgresDatabaseUrl(process.env.DATABASE_URL)) return null;
-  if (!_pgPool) {
+  if (!_pgPoolPromise) {
+    _pgPoolPromise = createPostgresPool().finally(() => { _pgPoolPromise = null; });
+  }
+  return _pgPoolPromise;
+}
+
+async function createPostgresPool(): Promise<pg.Pool | null> {
+  let pool: pg.Pool | null = null;
+  {
     try {
-      _pgPool = new pg.Pool({
+      /*
+        Tuned for a high-latency link rather than a local socket. The database
+        is reached over a relay at roughly 200ms round trip, and a Postgres
+        handshake costs several round trips before the first query, so a fresh
+        connection runs to about a second even when everything is healthy.
+
+        - connectionTimeoutMillis: 5s left almost no headroom once the relay was
+          congested, which is what produced "Connection terminated due to
+          connection timeout" during an ordinary page refresh.
+        - idleTimeoutMillis: the node-postgres default of 10s retired warm
+          connections between page loads, so a merchant returning half a minute
+          later paid the full handshake again on every one of them.
+        - keepAlive: stops a relay or NAT dropping an idle connection silently
+          and leaving the pool holding one that is already dead.
+      */
+      pool = new pg.Pool({
         connectionString: process.env.DATABASE_URL,
         max: 10,
-        connectionTimeoutMillis: 5_000,
+        connectionTimeoutMillis: 15_000,
+        idleTimeoutMillis: 60_000,
+        keepAlive: true,
+        keepAliveInitialDelayMillis: 10_000,
       });
-      _pgPool.on("error", (error) => {
+      pool.on("error", (error) => {
         console.warn("[Database] PostgreSQL pool error");
       });
-      await ensurePostgresSchema(_pgPool);
+      await ensurePostgresSchema(pool);
+      // Only now is it safe for anyone else to see it.
+      _pgPool = pool;
+      // Back in service: let a later failure start its own cooldown.
+      _pgUnavailableReason = null;
+      _pgUnavailableUntil = 0;
     } catch (error) {
       _pgUnavailableReason = error instanceof Error ? error.message : String(error);
-      console.warn("[Database] PostgreSQL unavailable; using in-memory fallback");
-      await _pgPool?.end().catch(() => undefined);
+      _pgUnavailableUntil = Date.now() + PG_UNAVAILABLE_COOLDOWN_MS;
+      // Name the cause. Falling back to in-memory means every merchant and API
+      // key silently reads as missing, so the reason for it must not be a
+      // mystery. Message only, no stack and no driver object, since those can
+      // carry the host and credentials.
+      console.warn("[Database] PostgreSQL unavailable; using in-memory fallback", {
+        reason: _pgUnavailableReason.slice(0, 200),
+      });
+      await pool?.end().catch(() => undefined);
       _pgPool = null;
+      // The cached drizzle handle may wrap the pool just ended. Drop it so the
+      // next caller rebuilds against a live one instead of a dead one.
+      _db = null;
       return null;
     }
   }
@@ -374,8 +458,18 @@ async function getPostgresPool() {
 }
 
 async function pgSelectOne<T>(pool: pg.Pool, table: string, where: string, values: unknown[]): Promise<T | undefined> {
-  const result = await pool.query(`SELECT * FROM ${q(table)} WHERE ${where} LIMIT 1`, values);
-  return result.rows[0] as T | undefined;
+  const sql = `SELECT * FROM ${q(table)} WHERE ${where} LIMIT 1`;
+  try {
+    const result = await pool.query(sql, values);
+    return result.rows[0] as T | undefined;
+  } catch (error) {
+    // One retry, and only for a dropped or timed-out connection. A SELECT is
+    // idempotent, so re-running it is safe; a single blip on the relay should
+    // not reach the merchant as "Database is temporarily unavailable".
+    if (!isTransientConnectionError(error)) throw error;
+    const result = await pool.query(sql, values);
+    return result.rows[0] as T | undefined;
+  }
 }
 
 async function pgInsert(pool: pg.Pool, table: string, data: Record<string, unknown>) {

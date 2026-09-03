@@ -4,6 +4,42 @@ import { type Server } from "http";
 import { nanoid } from "nanoid";
 import path from "path";
 
+/**
+ * Paths that are asking for a file, not for a page.
+ *
+ * The dev fallback below answers unmatched routes with index.html so that deep
+ * links survive a refresh. Applying that to an asset request turns into a 500:
+ * Vite derives its inline-<style> proxy id from the
+ * request path, so a URL ending in ".json" yields the module id
+ * "/missing.json?html-proxy&direct&index=0.css". That id matches the vite:json
+ * plugin's filter (/\.json(?:$|\?)/), so the plugin is handed the stylesheet
+ * from index.html, tries to JSON.parse it, and throws "Failed to parse JSON
+ * file." — surfacing as a 500 and a stack trace in the terminal for what should
+ * have been a plain 404. Any missing .json under the app's origin does it, and
+ * Chrome DevTools requests exactly one of those on every page load.
+ *
+ * Dev only. The production fallback is deliberately left as it was: it runs no
+ * Vite transform, so it cannot hit this, and changing what it returns for a
+ * missing asset would be a live behaviour change this bug does not require.
+ *
+ * Matched against a known extension list rather than "contains a dot", so a
+ * route parameter that happens to carry one is still served the app.
+ */
+const STATIC_ASSET_PATH =
+  /\.(?:json|webmanifest|js|mjs|cjs|css|map|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|otf|eot|txt|xml|pdf|mp4|webm|wasm)$/i;
+
+function isStaticAssetRequest(originalUrl: string): boolean {
+  const pathname = originalUrl.split("?")[0];
+  // Decode first: "/x%2Ejson" carries no literal extension, so an undecoded
+  // test waves it through and it lands back on the crash this guard exists to
+  // prevent. Malformed escapes throw, in which case the raw path is all we have.
+  let decoded = pathname;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch { /* keep the raw path */ }
+  return STATIC_ASSET_PATH.test(decoded) || STATIC_ASSET_PATH.test(pathname);
+}
+
 export async function setupVite(app: Express, server: Server) {
   const { createServer: createViteServer } = await import("vite");
 
@@ -22,6 +58,13 @@ export async function setupVite(app: Express, server: Server) {
   app.use(vite.middlewares);
   app.use("*", async (req, res, next) => {
     const url = req.originalUrl;
+
+    // Vite's own middlewares above already served every asset that exists, so
+    // anything reaching here with a file extension is genuinely missing.
+    if (isStaticAssetRequest(url)) {
+      res.status(404).end();
+      return;
+    }
 
     try {
       const clientTemplate = path.resolve(

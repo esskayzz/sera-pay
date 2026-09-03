@@ -44,6 +44,67 @@ function formatAmountForCoin(value: number, coin: Stablecoin | null | undefined)
   return formatDecimalAmount(value, Number.isInteger(decimals) ? Math.min(6, decimals) : 6);
 }
 
+/**
+ * What the merchant was in the middle of setting up, kept across a sign-in.
+ *
+ * Privy's Google/Twitter login ends in `window.location.assign(...)` — a full
+ * page unload — so every piece of in-memory form state dies mid-flow. The
+ * merchant returns to a blank form and has to set the whole request up again.
+ * Email and wallet sign-in never navigate, which is exactly why this looked
+ * intermittent rather than broken.
+ *
+ * Persisted rather than held in memory so it survives that unload, an
+ * ErrorBoundary reload, and a manual refresh. localStorage rather than
+ * sessionStorage because an OAuth round trip can land in a different tab or
+ * browser context on mobile.
+ */
+const PENDING_REQUEST_KEY = "serapay_pending_request";
+/** Long enough to finish signing in; short enough not to resurrect stale work. */
+const PENDING_REQUEST_TTL_MS = 30 * 60 * 1000;
+
+type PendingRequest = {
+  receiveCoin?: string;
+  amount?: string;
+  payCoin?: string;
+  payAmount?: string;
+  /** True when the merchant pressed Generate QR and was sent to sign in. */
+  wantQr?: boolean;
+  /**
+   * The wallet this was drafted under, once one is known. A record written
+   * while signed out has none, which is the case this whole mechanism exists
+   * for. On a shared or counter browser it stops one merchant's draft being
+   * restored into the next merchant's form.
+   */
+  owner?: string;
+  savedAt?: number;
+};
+
+function readPendingRequest(): PendingRequest | null {
+  try {
+    const raw = localStorage.getItem(PENDING_REQUEST_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PendingRequest;
+    if (!parsed || typeof parsed !== "object") return null;
+    if (!parsed.savedAt || Date.now() - parsed.savedAt > PENDING_REQUEST_TTL_MS) {
+      localStorage.removeItem(PENDING_REQUEST_KEY);
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writePendingRequest(request: PendingRequest) {
+  try {
+    localStorage.setItem(PENDING_REQUEST_KEY, JSON.stringify({ ...request, savedAt: Date.now() }));
+  } catch {}
+}
+
+function clearPendingRequest() {
+  try { localStorage.removeItem(PENDING_REQUEST_KEY); } catch {}
+}
+
 function normalizeQrStyleValue(value: string | null | undefined, fallback: QrStyle = "rounded"): QrStyle {
   if (value === "classy") return "classy-rounded";
   return QR_STYLE_IDS.has(value as QrStyle) ? (value as QrStyle) : fallback;
@@ -1842,9 +1903,25 @@ export default function Home() {
     return () => clearTimeout(timer);
   }, [ready]);
 
+  // Captured on the first render so the restore below reads the record as it
+  // was at page load, before any effect starts writing to it.
+  // Lazily, once. useRef evaluates its argument on every render, and
+  // readPendingRequest both parses localStorage and can delete from it — not
+  // something to run on each keystroke of a component this size.
+  const pendingRequestRef = useRef<PendingRequest | null | undefined>(undefined);
+  if (pendingRequestRef.current === undefined) pendingRequestRef.current = readPendingRequest();
+  const pendingRestoredRef = useRef(false);
+  const pendingResumeRef = useRef(false);
+
   const [step, setStep] = useState<1 | 2>(1); // 1 = form, 2 = QR display
   const [selectedCoin, setSelectedCoin] = useState<Stablecoin | null>(null);
   const [currencies, setCurrencies] = useState<SeraCurrency[]>([]);
+  /**
+   * Counterpart symbols that can actually be priced against each coin, measured
+   * server-side. Empty while the map is cold — and a cold map must never hide
+   * anything, so the filter below only applies once data exists.
+   */
+  const [viablePairs, setViablePairs] = useState<Record<string, string[]>>({});
   const [currenciesLoading, setCurrenciesLoading] = useState(true);
   const [currenciesError, setCurrenciesError] = useState("");
   const [amount, setAmount] = useState("");
@@ -1928,6 +2005,25 @@ export default function Home() {
   // at all, so this is read in conversion mode only.
   const conversionMinimum = isConversionMode ? getConversionMinimum(customerCoin) : null;
   const belowConversionMinimum = isBelowConversionMinimum(customerAmount, conversionMinimum);
+  /**
+   * The coins a customer could actually pay with, given what the merchant wants
+   * to receive. A pair with no quotable liquidity would only dead-end at "Live
+   * rates unavailable" after being chosen, so it is not offered.
+   *
+   * Unfiltered whenever we cannot know better: no receive coin picked yet, or
+   * the tracker has no data for it. Hiding the whole list on missing data would
+   * be far worse than showing a pair that later fails. The receive coin itself
+   * always stays, since paying in the same coin needs no conversion at all.
+   */
+  const payableCounterparts = (() => {
+    if (!selectedCoin) return currencies;
+    const allowed = viablePairs[selectedCoin.symbol.toUpperCase()];
+    if (!allowed?.length) return currencies;
+    const allowedSet = new Set(allowed.map((symbol) => symbol.toUpperCase()));
+    return currencies.filter((coin) =>
+      coin.symbol.toUpperCase() === selectedCoin.symbol.toUpperCase() || allowedSet.has(coin.symbol.toUpperCase()));
+  })();
+
   const canGenerateQr = Boolean(selectedCoin) && !currenciesLoading && !currenciesError && !rateLoading && conversionReady && !belowConversionMinimum;
 
   /**
@@ -1957,17 +2053,58 @@ export default function Home() {
       .then((loaded) => {
         if (!active) return;
         setCurrencies(loaded);
+        /*
+          The coin half of the record stays available for as long as the record
+          lives. A registry reload — a chain change, an auth change, a retry —
+          re-runs this effect, and without the record a coin the merchant had
+          already chosen is resolved against a registry that has not arrived yet
+          and lost. Re-applying is safe because it only ever fills a blank: a
+          current selection always wins over the record.
+        */
+        // A draft from a different merchant is not ours to restore.
+        if (
+          pendingRequestRef.current?.owner &&
+          walletAddress &&
+          pendingRequestRef.current.owner.toLowerCase() !== walletAddress.toLowerCase()
+        ) {
+          clearPendingRequest();
+          pendingRequestRef.current = null;
+          pendingResumeRef.current = false;
+        }
+        const pendingCoins = pendingRequestRef.current;
+        /*
+          The amount half is applied once. Amounts are not touched by a registry
+          reload, so re-filling them could only ever resurrect a figure the
+          merchant had deliberately cleared while typing a new one.
+        */
+        const pending = pendingRestoredRef.current ? null : pendingRequestRef.current;
         const savedCoin = walletAddress
           ? localStorage.getItem(`serapay_coin_${walletAddress}`) || localStorage.getItem("serapay_receive_coin")
           : null;
-        setSelectedCoin((current) => loaded.find((coin) => coin.symbol === (current?.symbol || savedCoin)) ?? null);
-        setCustomerCoin((current) => current ? loaded.find((coin) => coin.symbol === current.symbol) ?? null : null);
+        // A request interrupted by sign-in outranks the last-used coin: it is
+        // what the merchant was actually doing when they were sent away.
+        setSelectedCoin((current) => loaded.find((coin) => coin.symbol === (current?.symbol || pendingCoins?.receiveCoin || savedCoin)) ?? null);
+        setCustomerCoin((current) => {
+          const wanted = current?.symbol || pendingCoins?.payCoin;
+          return wanted ? loaded.find((coin) => coin.symbol === wanted) ?? null : null;
+        });
+        if (pending) {
+          // Only fill blanks. Anything already typed on this page is newer than
+          // the record and must win.
+          if (pending.amount) setAmount((current) => current || pending.amount!);
+          if (pending.payAmount) setCustomerAmount((current) => current || pending.payAmount!);
+          if (pending.wantQr) pendingResumeRef.current = true;
+          pendingRestoredRef.current = true;
+        }
       })
       .catch((error) => {
         if (!active) return;
         setCurrencies([]);
-        setSelectedCoin(null);
-        setCustomerCoin(null);
+        // Deliberately NOT clearing selectedCoin/customerCoin. This effect
+        // re-runs two or three times around a single sign-in, so a transient
+        // registry failure used to throw away a coin the merchant had
+        // explicitly picked. The error below already blocks QR generation
+        // until the registry is back.
         setCurrenciesError(error instanceof Error ? error.message : "Unable to load currencies from Sera");
       })
       .finally(() => {
@@ -2001,6 +2138,59 @@ export default function Home() {
     if (walletAddress) localStorage.setItem(`serapay_name_${walletAddress}`, merchantProfile.name);
   }, [merchantProfile?.name, walletAddress]);
 
+  useEffect(() => {
+    let active = true;
+    fetch(`/api/sera/pairs?chainId=${paymentChainId}`)
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data) => { if (active && data?.pairs) setViablePairs(data.pairs); })
+      .catch(() => { /* advisory only — the picker still works without it */ });
+    return () => { active = false; };
+  }, [paymentChainId]);
+
+  // Mirror the in-progress request so a sign-in redirect cannot lose it. Only
+  // on step 1: once the QR exists the request is already encoded in its URL.
+  useEffect(() => {
+    if (step !== 1) return;
+    if (!selectedCoin && !amount && !customerCoin && !customerAmount) {
+      // Emptied on purpose. Returning early here used to leave the previous
+      // copy in storage, so a figure the merchant had just deleted came back on
+      // the next load.
+      clearPendingRequest();
+      pendingRequestRef.current = null;
+      pendingResumeRef.current = false;
+      return;
+    }
+    // Keep the ref in step with the form as well as the stored copy. The coin
+    // re-application above reads this ref, so a stale copy could put back a
+    // Customer Pays coin the merchant had just cleared.
+    pendingRequestRef.current = {
+      receiveCoin: selectedCoin?.symbol,
+      amount,
+      payCoin: customerCoin?.symbol,
+      payAmount: customerAmount,
+      wantQr: pendingRequestRef.current?.wantQr,
+      owner: walletAddress || pendingRequestRef.current?.owner,
+    };
+    writePendingRequest(pendingRequestRef.current);
+  }, [step, selectedCoin, amount, customerCoin, customerAmount, walletAddress]);
+
+  /**
+   * Withdraws the pending "generate a QR once I am signed in" intent.
+   *
+   * The intent is recorded the moment the merchant presses Generate QR while
+   * signed out. If they then back out of the sign-in prompt it has to be
+   * withdrawn too — otherwise it survives in storage, its 30-minute window is
+   * pushed forward by every later edit, and the next time an address appears
+   * the form jumps to a QR the merchant had abandoned. The rest of the draft
+   * stays; only the intent to act on it is dropped.
+   */
+  const cancelPendingQrIntent = useCallback(() => {
+    pendingResumeRef.current = false;
+    if (!pendingRequestRef.current?.wantQr) return;
+    pendingRequestRef.current = { ...pendingRequestRef.current, wantQr: false };
+    writePendingRequest(pendingRequestRef.current);
+  }, []);
+
   const handleConnectWallet = useCallback(async () => {
     if (isConnected) {
       setLocation("/dashboard");
@@ -2013,10 +2203,21 @@ export default function Home() {
 
   const openLoginMethods = useCallback((methods: HomeLoginMethod[]) => {
     try {
+      // Record the intent BEFORE Privy can navigate away — the OAuth paths
+      // unload the page, so anything written after this point may never run.
+      const wantQr = pendingRequestRef.current?.wantQr ?? false;
+      pendingRequestRef.current = {
+        receiveCoin: selectedCoin?.symbol,
+        amount,
+        payCoin: customerCoin?.symbol,
+        payAmount: customerAmount,
+        wantQr,
+      };
+      writePendingRequest(pendingRequestRef.current);
       (login as any)({ loginMethods: methods });
       setShowGuestReceiverModal(false);
     } catch {}
-  }, [login]);
+  }, [login, selectedCoin, amount, customerCoin, customerAmount]);
 
   const openSeraLogin = useCallback(() => openLoginMethods(["email", "google", "twitter"]), [openLoginMethods]);
 
@@ -2194,25 +2395,61 @@ export default function Home() {
     // merchant from printing a QR that cannot be paid.
     if (isBelowConversionMinimum(customerAmount, getConversionMinimum(customerCoin))) return;
     if (!receiverAddress) {
+      // They asked for a QR and are about to be sent to sign in; remember it so
+      // the request resumes itself afterwards instead of making them start over.
+      pendingRequestRef.current = {
+        receiveCoin: selectedCoin?.symbol,
+        amount,
+        payCoin: customerCoin?.symbol,
+        payAmount: customerAmount,
+        wantQr: true,
+      };
+      writePendingRequest(pendingRequestRef.current);
       setShowGuestReceiverModal(true);
       return;
     }
     const url = createPaymentUrl();
     if (!url) return;
+    clearPendingRequest();
+    pendingRequestRef.current = null;
+    pendingResumeRef.current = false;
     setPaymentUrl(url);
     setStep(2);
   }, [createPaymentUrl, customerAmount, customerCoin, exchangeRate, receiverAddress, selectedCoin]);
+
+  /**
+   * Finishes the job the merchant started before signing in. Runs once, only
+   * when everything it needs has settled: a receiving address, the registry,
+   * and — for a conversion — a rate. Anything less would build a QR from
+   * half-loaded state.
+   */
+  useEffect(() => {
+    if (!pendingResumeRef.current) return;
+    if (step !== 1 || !selectedCoin || !receiverAddress) return;
+    if (currenciesLoading || currenciesError || rateLoading) return;
+    if (customerCoin && customerCoin.symbol !== selectedCoin.symbol && !exchangeRate) return;
+    pendingResumeRef.current = false;
+    // Go through the button's own handler rather than rebuilding a subset of
+    // it. A resumed request has to be refused for exactly the reasons a fresh
+    // one would be — no customer amount, or an amount under Sera's floor for
+    // the pair — and duplicating those checks here is how they drift apart.
+    // On success it clears the stored draft itself; if it refuses, the draft
+    // stays on screen with the reason, and cannot resume again.
+    cancelPendingQrIntent();
+    handleGenerateQR();
+  }, [step, selectedCoin, receiverAddress, currenciesLoading, currenciesError, rateLoading, customerCoin, exchangeRate, handleGenerateQR, cancelPendingQrIntent]);
 
   const handleGuestReceiverSubmit = useCallback((address: string) => {
     if (!selectedCoin) return;
     const nextAddress = address.trim();
     setGuestReceiverAddress(nextAddress);
     setShowGuestReceiverModal(false);
+    cancelPendingQrIntent();
     const url = createPaymentUrl({ receiverAddress: nextAddress });
     if (!url) return;
     setPaymentUrl(url);
     setStep(2);
-  }, [createPaymentUrl, selectedCoin]);
+  }, [createPaymentUrl, selectedCoin, cancelPendingQrIntent]);
 
   const handleCopyLink = useCallback(async () => {
     try {
@@ -3537,7 +3774,7 @@ export default function Home() {
           onSelect={setCustomerCoin}
           onClear={handleClearCustomerCoin}
           selectedSymbol={customerCoin?.symbol}
-          coins={currencies}
+          coins={payableCounterparts}
         />
       )}
 
@@ -3564,7 +3801,7 @@ export default function Home() {
 
       {showGuestReceiverModal ? (
         <GuestReceiverModal
-          onClose={() => setShowGuestReceiverModal(false)}
+          onClose={() => { setShowGuestReceiverModal(false); cancelPendingQrIntent(); }}
           onSubmitAddress={handleGuestReceiverSubmit}
           onConnect={openLoginMethods}
           onSeraLogin={openSeraLogin}
