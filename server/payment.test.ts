@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import type { Transaction } from "../drizzle/schema";
 
 describe("Sera API audit log redaction", () => {
   it.each([
@@ -446,4 +447,110 @@ describe("auth.logout", () => {
     expect(appRouter).toBeDefined();
     expect(appRouter._def.procedures).toHaveProperty("auth.logout");
   });
+});
+
+// Scan & Pay (wallet-URI QR) server-side watch and poller ownership
+describe("Scan & Pay watch rows", () => {
+  const RECEIVER = "0x1234567890abcdef1234567890abcdef12345678";
+  const LINK = "https://pay.sera.cx/pay/abc.sig";
+  const OTHER_LINK = "https://pay.sera.cx/pay/def.sig";
+  const HASH = "0x" + "ab".repeat(32);
+  const watchNotes = (paymentUrl: string | null) => JSON.stringify({ type: "direct_wallet_qr", paymentUrl, watch: true });
+  const qrKey = { receiveAddress: RECEIVER, coin: "IDRT", amount: "2000", chainId: 1, decimals: 2, paymentUrl: LINK };
+
+  function makeTx(overrides: Partial<Transaction> = {}): Transaction {
+    return {
+      id: "tx-1",
+      merchantId: "merchant-1",
+      txHash: null,
+      fromAddress: null,
+      toAddress: RECEIVER,
+      coin: "IDRT",
+      amount: "2000",
+      amountUsd: null,
+      chainId: 1,
+      status: "pending",
+      payCoin: "IDRT",
+      payAmount: "2000",
+      memo: null,
+      notes: watchNotes(LINK),
+      verified: 0,
+      notifiedAt: null,
+      webhookSentAt: null,
+      createdAt: new Date("2026-09-04T10:00:00Z"),
+      updatedAt: new Date("2026-09-04T10:00:00Z"),
+      ...overrides,
+    } as Transaction;
+  }
+
+  it("reuses the live watch row for the same QR instead of inserting another", async () => {
+    const { findDirectQrWatchRow, isLiveDirectQrWatch } = await import("./payment-routes");
+    // Postgres returns numeric(36,18) padded to 18 decimals; the row must
+    // still match a 2-decimal IDRT amount of "2000".
+    const live = makeTx({ id: "watch-live", amount: "2000.000000000000000000" });
+    const rows = [
+      makeTx({ id: "other-link", notes: watchNotes(OTHER_LINK) }),
+      makeTx({ id: "other-coin", coin: "USDC", payCoin: "USDC" }),
+      makeTx({ id: "other-amount", amount: "2000.01", payAmount: "2000.01" }),
+      makeTx({ id: "checkout-row", notes: JSON.stringify({ paymentUrl: LINK }) }),
+      makeTx({ id: "old-direct-row", notes: JSON.stringify({ type: "direct_wallet_qr", paymentUrl: LINK }) }),
+      live,
+    ];
+    const found = findDirectQrWatchRow(rows, qrKey);
+    expect(found?.id).toBe("watch-live");
+    expect(isLiveDirectQrWatch(found!)).toBe(true);
+    expect(findDirectQrWatchRow(rows, { ...qrKey, paymentUrl: OTHER_LINK })?.id).toBe("other-link");
+    expect(findDirectQrWatchRow(rows, { ...qrKey, amount: "3000" })).toBeNull();
+  }, 15_000);
+
+  it("returns a settled watch row as the QR's anchor but never as a live watch", async () => {
+    const { findDirectQrWatchRow, isLiveDirectQrWatch } = await import("./payment-routes");
+    const confirmed = makeTx({ id: "watch-paid", status: "confirmed", verified: 1, txHash: HASH });
+    const expired = makeTx({ id: "watch-expired", status: "canceled" });
+    for (const row of [confirmed, expired]) {
+      // Newest first, as getMerchantTransactions orders them.
+      expect(findDirectQrWatchRow([row], qrKey)?.id).toBe(row.id);
+      expect(isLiveDirectQrWatch(row)).toBe(false);
+    }
+  }, 15_000);
+
+  it("keeps unpaid watch rows out of the merchant's list until a transfer confirms them", async () => {
+    const { isUnpaidDirectQrWatch, isDirectQrWatchTransaction } = await import("./payment-routes");
+    expect(isUnpaidDirectQrWatch(makeTx())).toBe(true);
+    expect(isUnpaidDirectQrWatch(makeTx({ status: "canceled" }))).toBe(true);
+    expect(isUnpaidDirectQrWatch(makeTx({ status: "confirmed", verified: 1, txHash: HASH }))).toBe(false);
+    // Rows the scan route recorded directly, or the sweep, are payments.
+    const plain = makeTx({ txHash: HASH, status: "confirmed", notes: JSON.stringify({ type: "direct_wallet_qr", paymentUrl: LINK }) });
+    expect(isDirectQrWatchTransaction(plain)).toBe(false);
+    expect(isUnpaidDirectQrWatch(plain)).toBe(false);
+    expect(isDirectQrWatchTransaction(makeTx({ notes: "free text the merchant typed" }))).toBe(false);
+    expect(isDirectQrWatchTransaction(makeTx({ notes: null }))).toBe(false);
+  }, 15_000);
+
+  it("reports a transfer already on file only when it belongs to this QR", async () => {
+    const { directTransferBelongsToQr } = await import("./payment-routes");
+    const watchStartedAt = new Date("2026-09-04T10:00:00Z");
+    const before = new Date("2026-09-04T09:59:30Z");
+    const after = new Date("2026-09-04T10:00:20Z");
+    const recorded = (notes: string | null, createdAt: Date) =>
+      makeTx({ txHash: HASH, status: "confirmed", verified: 1, notes, createdAt });
+
+    // The watch row the sweep confirmed, or a re-poll of this QR's own record.
+    expect(directTransferBelongsToQr(recorded(watchNotes(LINK), watchStartedAt), LINK, watchStartedAt)).toBe(true);
+    expect(directTransferBelongsToQr(recorded(JSON.stringify({ type: "direct_wallet_qr", paymentUrl: LINK }), after), LINK, watchStartedAt)).toBe(true);
+    // The sweep records what it cannot match without a link.
+    expect(directTransferBelongsToQr(recorded(JSON.stringify({ type: "direct_wallet_qr", paymentUrl: null }), after), LINK, watchStartedAt)).toBe(true);
+    expect(directTransferBelongsToQr(recorded(null, after), LINK, watchStartedAt)).toBe(true);
+
+    // Another QR's payment in the look-back window.
+    expect(directTransferBelongsToQr(recorded(JSON.stringify({ type: "direct_wallet_qr", paymentUrl: OTHER_LINK }), after), LINK, watchStartedAt)).toBe(false);
+    // The previous customer's identically priced QR carries the identical
+    // link; only the watch's start time tells them apart.
+    expect(directTransferBelongsToQr(recorded(watchNotes(LINK), before), LINK, watchStartedAt)).toBe(false);
+    expect(directTransferBelongsToQr(recorded(null, before), LINK, watchStartedAt)).toBe(false);
+
+    // Without a watch row (a receiver no merchant owns) the link alone decides.
+    expect(directTransferBelongsToQr(recorded(watchNotes(LINK), before), LINK, null)).toBe(true);
+    expect(directTransferBelongsToQr(recorded(JSON.stringify({ paymentUrl: OTHER_LINK }), before), LINK, null)).toBe(false);
+  }, 15_000);
 });

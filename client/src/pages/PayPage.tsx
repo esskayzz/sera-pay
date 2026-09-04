@@ -507,7 +507,6 @@ export default function PayPage() {
   const [phase, setPhase] = useState<Phase>("loading");
   const [req, setReq] = useState<PaymentRequest | null>(null);
   const [selectedCoin, setSelectedCoin] = useState<Stablecoin | null>(null);
-  const [payerChangedCoinInCheckout, setPayerChangedCoinInCheckout] = useState(false);
   const [supportedCoins, setSupportedCoins] = useState<SeraCurrency[]>([]);
   const [registryLoading, setRegistryLoading] = useState(true);
   const [registryError, setRegistryError] = useState("");
@@ -532,6 +531,9 @@ export default function PayPage() {
   const payRateRequestRef = useRef(0);
   const registryRequestKeyRef = useRef("");
   const orderPaymentCoinRef = useRef<string | null>(null);
+  // What the merchant receives on a Sera swap, as /payment/swap/quote recorded
+  // it (expectedReceiveAmount). Read by the receipt only.
+  const swapReceiveAmountRef = useRef<string | null>(null);
 
   // Rate-changed confirmation
   const [showRateChanged, setShowRateChanged] = useState(false);
@@ -611,7 +613,22 @@ export default function PayPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [req, selectedCoin?.symbol, rateRefreshKey, chainId]);
 
-  const requiresSeraSwap = Boolean(req?.swap === true && !payerChangedCoinInCheckout && selectedCoin && selectedCoin.symbol !== req.receiveCoin);
+  /*
+    Paying in a coin other than the one the merchant receives IS a Sera swap.
+    Owner's instruction, 2026-09-04: the customer picks any supported coin,
+    signs, and pays — the conversion is Sera's job and nothing more is asked
+    of them. This reverses the 2026-07-23 gate (commit fbbc720, "Bug fix"),
+    which also required the link to carry `swap: true` AND the payer to have
+    left the coin untouched. Nothing ever set that flag — the server's
+    sanitizeCheckoutRequest never signs it — so the swap branch in executePay
+    was unreachable: a customer who chose another coin fell through to the
+    direct-transfer path, where /payment/create substitutes the link's
+    receive coin and the token check then fails with "token metadata changed
+    while this payment was open". Every cross-coin payment failed. The
+    decision now rests on the coins alone; the direct-transfer path is for
+    same-coin payments only.
+  */
+  const requiresSeraSwap = Boolean(req && selectedCoin && selectedCoin.symbol !== req.receiveCoin);
   const selectedCoinSupported = Boolean(selectedCoin && supportedCoins.some((coin) => coin.symbol === selectedCoin.symbol));
   // True when the payment request has no fixed amount — customer types their own amount
   const isOpenAmount = !hasOrderItems && !req?.amount;
@@ -685,37 +702,6 @@ export default function PayPage() {
     return () => { cancelled = true; };
   }, [activeWalletAddress, selectedCoin?.contractAddress, selectedCoin?.decimals, chainId]);
 
-  // Gas fee estimation
-  const [gasUsd, setGasUsd] = useState<string | null>(null);
-  useEffect(() => {
-    if (!selectedCoin) { setGasUsd(null); return; }
-    const ERC20_GAS = 65000n;
-    const chainRpc: Record<number, string> = {
-      11155111: import.meta.env.VITE_SEPOLIA_RPC_URL || "https://ethereum-sepolia-rpc.publicnode.com",
-      1: import.meta.env.VITE_MAINNET_RPC_URL || "https://ethereum-rpc.publicnode.com",
-    };
-    const rpc = chainRpc[chainId] || chainRpc[LIVE_PAYMENT_CHAIN_ID];
-    let cancelled = false;
-    (async () => {
-      try {
-        const [gasRes, priceRes] = await Promise.all([
-          fetch(rpc, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", method: "eth_gasPrice", params: [], id: 1 }) }),
-          fetch("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"),
-        ]);
-        if (cancelled) return;
-        const gasData = await gasRes.json();
-        const priceData = await priceRes.json();
-        const gasPriceWei = BigInt(gasData.result || "0x0");
-        const ethUsd: number = priceData?.ethereum?.usd || 0;
-        if (!gasPriceWei || !ethUsd) { setGasUsd(null); return; }
-        const gasCostWei = gasPriceWei * ERC20_GAS;
-        const gasCostEth = Number(gasCostWei) / 1e18;
-        const gasCostUsd = gasCostEth * ethUsd;
-        if (!cancelled) setGasUsd(gasCostUsd < 0.01 ? "<$0.01" : `~$${gasCostUsd.toFixed(2)}`);
-      } catch { if (!cancelled) setGasUsd(null); }
-    })();
-    return () => { cancelled = true; };
-  }, [selectedCoin, chainId]);
 
   useEffect(() => {
     if (!encoded) { setPhase("invalid"); return; }
@@ -729,7 +715,6 @@ export default function PayPage() {
       if (!checkout.signed) { setPhase("invalid"); return; }
       const decoded = checkout.request;
       setReq(decoded);
-      setPayerChangedCoinInCheckout(false);
       // Check expiry
       if (decoded.expiresAt && Date.now() > decoded.expiresAt) {
         setPhase("invalid"); return;
@@ -811,10 +796,25 @@ export default function PayPage() {
         // customer hit an error before the payment could even start.
         const payTokenDecimals = Number(supportedCoins.find((c) => c.symbol === payCoin)?.decimals);
         const maxPayDecimals = Number.isInteger(payTokenDecimals) ? Math.min(6, payTokenDecimals) : 6;
-        const formatted = converted >= 1
-          ? converted.toLocaleString(undefined, { maximumFractionDigits: Math.min(2, maxPayDecimals) })
-          : formatDecimalAmount(converted, maxPayDecimals);
-        setPayAmount(formatted);
+        // payAmount is machine data, not display text: Confirm & Pay reads it
+        // back (the rate-change comparison, the balance check) and every
+        // reader strips commas before parsing, so it has to stay a canonical
+        // dot-decimal string. The figure handlePay actually sends is
+        // recomputed there from a fresh rate under this same rule.
+        //
+        // toLocaleString formats in the PAYER's locale while the read-back path
+        // strips commas. In a comma-decimal locale — id-ID, de-DE, fr-FR, and
+        // so much of this product's own market — that pair silently corrupts
+        // the figure: 12.34 formats as "12,34" and strips to 1234 (100x
+        // overpayment), and 1234.56 formats as "1.234,56" and strips to
+        // 1.23456 (1000x underpayment). Never round-trip an amount through a
+        // locale formatter. formatDecimalAmount is locale-independent and
+        // keeps the digits the locale path gave an en-US payer — 2 places from
+        // 1 upward, the token's precision below that — minus thousands
+        // grouping, which every reader strips anyway. If a display ever wants
+        // grouping, apply it at render time to a copy, never to this state.
+        const payDecimals = converted >= 1 ? Math.min(2, maxPayDecimals) : maxPayDecimals;
+        setPayAmount(formatDecimalAmount(converted, payDecimals));
         rateRef.current = data.rate;
         setDisplayRate(`1 ${receiveCoin} ≈ ${data.rate >= 1 ? data.rate.toLocaleString(undefined, { maximumFractionDigits: 4 }) : data.rate.toFixed(6)} ${payCoin}`);
         setRateExpiry(Date.now() + RATE_TTL_SECONDS * 1000);
@@ -915,6 +915,7 @@ export default function PayPage() {
     if (!req || !selectedCoin) return;
     setPhase("paying");
     setTxError("");
+    swapReceiveAmountRef.current = null;
     try {
       const wallet = wallets?.[0];
       if (!wallet) throw new Error("No wallet connected");
@@ -925,7 +926,17 @@ export default function PayPage() {
       const activeWalletAddress = await getActiveWalletAddress(provider, wallet.address);
 
       const sendAmount = normalizeDecimalAmountText(finalPayAmount.replace(/,/g, ""));
-      const receiveAmountForQuote = normalizeDecimalAmountText((finalReceiveAmount || receiveAmount || req.amount || finalPayAmount).replace(/,/g, ""));
+      // What the merchant must receive, in the RECEIVE coin: the order total
+      // (finalReceiveAmount / receiveAmount) or the link's fixed amount. An
+      // open-amount link has neither — the customer typed a PAY-coin figure
+      // and nothing here can convert it (fetchRate never runs without
+      // req.amount, so rateRef is unset). This used to fall back to the pay
+      // amount itself, sending e.g. "100000" IDRT as "100000 USDC", and the
+      // server scaled maxInputAmount to deliver that many receive-coin units
+      // — off by the exchange rate, not by rounding. Send nothing instead:
+      // /payment/swap/quote treats a missing receiveAmount as null and
+      // records the quote's own minOutputAmount as what the merchant receives.
+      const receiveAmountForQuote = normalizeDecimalAmountText((finalReceiveAmount || receiveAmount || req.amount || "").replace(/,/g, ""));
       if (!sendAmount) throw new Error("Invalid payment amount");
 
       if (requiresSeraSwap) {
@@ -937,9 +948,29 @@ export default function PayPage() {
         const attemptStartedAt = Date.now();
         const swapExpiration = Math.floor((attemptStartedAt + PAYMENT_ATTEMPT_MAX_MS) / 1000);
         let quoteRetries = 0;
+        /*
+          The pending transaction row this attempt is priced against. It is
+          kept across stale-quote retries: /payment/swap/quote refreshes a row
+          in place when it is sent the txId of one that is still pending, so
+          a retry re-prices the SAME row instead of opening another. A row
+          left pending auto-cancels after five minutes with a merchant
+          'transaction_auto_canceled' event, and retries used to drop the id
+          unconditionally. (The submit route fails its row before answering a
+          stale error — failTransactionRecord in its catch — so after a stale
+          SUBMIT the refresh is refused below and a fresh row is opened; the
+          reuse pays off when the stale answer left the row pending.)
+        */
         let quoteTransactionId = "";
+        /*
+          Set when the server answered quote_stale to a refresh of
+          quoteTransactionId. It gives that answer only after looking the row
+          up and finding it no longer pending, so the id is dead and the next
+          quote has to open a fresh row.
+        */
+        let quoteRefreshRefused = false;
 
         const createSwapQuote = async () => {
+          const refreshTxId = quoteTransactionId;
           const quoteRes = await fetch("/api/payment/swap/quote", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -949,19 +980,26 @@ export default function PayPage() {
               payCoin: selectedCoin.symbol,
               receiveCoin: req.receiveCoin,
               payAmount: sendAmount,
-              receiveAmount: receiveAmountForQuote || sendAmount,
+              receiveAmount: receiveAmountForQuote || undefined,
               chainId: cid,
               paymentIntentId: (req as any).paymentIntentId,
               orderId: (req as any).orderId,
               expiration: swapExpiration,
-              txId: quoteTransactionId || undefined,
+              txId: refreshTxId || undefined,
               checkoutPayload: encoded || undefined,
             }),
           });
-          const quoteData = await readPaymentApiJson<any>(quoteRes, "Unable to create Sera swap quote");
+          let quoteData: any;
+          try {
+            quoteData = await readPaymentApiJson<any>(quoteRes, "Unable to create Sera swap quote");
+          } catch (error) {
+            if (refreshTxId && isQuoteStaleError(error)) quoteRefreshRefused = true;
+            throw error;
+          }
           quoteTransactionId = String(quoteData.txId || "");
           setTxId(quoteTransactionId);
           if (quoteData.payAmount) setPayAmount(String(quoteData.payAmount));
+          if (quoteData.expectedReceiveAmount) swapReceiveAmountRef.current = String(quoteData.expectedReceiveAmount);
           return quoteData;
         };
 
@@ -978,12 +1016,17 @@ export default function PayPage() {
           return { quoteTokenAddress, required };
         };
 
+        // The permit the customer has already signed, kept across retries so a
+        // re-quote that comes back with the identical permit (same value,
+        // nonce and deadline) reuses the signature instead of prompting again.
+        let permitSignature: string | undefined;
+        let signedPermitTypedData: unknown = null;
+        let signedPermitDeadline: unknown = null;
+
         while (true) {
           try {
             let quoteData = await createSwapQuote();
             let { quoteTokenAddress, required } = await validateSwapQuote(quoteData);
-            let permitSignature: string | undefined;
-            let permitDeadline = quoteData.permitDeadline;
 
             if (quoteData.approvalRequired) {
               const spender = String(quoteData.approvalSpender || "");
@@ -1012,27 +1055,34 @@ export default function PayPage() {
               }
             }
 
+            /*
+              One permit, one intent. The quote here is fresh — created a
+              moment ago, or refreshed right after the approval transaction
+              above — so the permit and the intent are both signed against it,
+              back to back. The former re-quote BETWEEN the two prompts (to
+              hand the intent a younger quote) came back with different permit
+              typed data whenever the price or the deadline had moved, and the
+              customer was asked to sign a second permit while the first was
+              thrown away. A quote that closes during the prompts now fails at
+              submit and lands in the stale retry below, whose re-quote reuses
+              this permit signature when the permit it returns is unchanged.
+            */
+            let submitPermitSignature: string | undefined;
+            let submitPermitDeadline: unknown = undefined;
             if (quoteData.permitTypedData) {
-              const signedPermitTypedData = quoteData.permitTypedData;
-              permitSignature = await provider.request({
-                method: "eth_signTypedData_v4",
-                params: [activeWalletAddress, JSON.stringify(signedPermitTypedData)],
-              }) as string;
-
-              // Sera quotes can close quickly. Refresh after the slower permit prompt so the
-              // final intent signature is made against a fresh, still-open quote.
-              quoteData = await createSwapQuote();
-              await validateSwapQuote(quoteData);
-              permitDeadline = quoteData.permitDeadline;
-              if (quoteData.permitTypedData && !sameTypedData(quoteData.permitTypedData, signedPermitTypedData)) {
+              const permitUnchanged = Boolean(permitSignature)
+                && sameTypedData(quoteData.permitTypedData, signedPermitTypedData)
+                && sameTypedData(quoteData.permitDeadline ?? null, signedPermitDeadline);
+              if (!permitUnchanged) {
                 permitSignature = await provider.request({
                   method: "eth_signTypedData_v4",
                   params: [activeWalletAddress, JSON.stringify(quoteData.permitTypedData)],
                 }) as string;
-              } else if (!quoteData.permitTypedData) {
-                permitSignature = undefined;
-                permitDeadline = undefined;
+                signedPermitTypedData = quoteData.permitTypedData;
+                signedPermitDeadline = quoteData.permitDeadline ?? null;
               }
+              submitPermitSignature = permitSignature;
+              submitPermitDeadline = quoteData.permitDeadline;
             }
 
             const signature = await provider.request({
@@ -1047,8 +1097,8 @@ export default function PayPage() {
                 txId: quoteData.txId,
                 quoteUuid: quoteData.quoteUuid,
                 signature,
-                permitSignature,
-                permitDeadline,
+                permitSignature: submitPermitSignature,
+                permitDeadline: submitPermitDeadline,
               }),
             });
             const submitData = await readPaymentApiJson<any>(submitRes, "Unable to submit Sera swap");
@@ -1057,14 +1107,26 @@ export default function PayPage() {
             return;
           } catch (error: any) {
             const stillWithinAttemptWindow = Date.now() - attemptStartedAt < PAYMENT_ATTEMPT_MAX_MS;
-            if (isQuoteStaleError(error) && stillWithinAttemptWindow && quoteRetries < MAX_SWAP_QUOTE_RETRIES) {
-              quoteRetries += 1;
+            if (!isQuoteStaleError(error) || !stillWithinAttemptWindow) throw error;
+            // Stop watching the row while it is re-priced: the status poll
+            // flips the page to "failed" on a row the server has failed, and
+            // the submit route fails its row before answering a stale error.
+            // createSwapQuote subscribes again — to the same id when the
+            // refresh went through, to the new one when it did not.
+            setTxId("");
+            if (quoteRefreshRefused) {
+              // Not a fresh attempt the customer sees, just this retry
+              // reissued without a dead id, so it does not count against
+              // MAX_SWAP_QUOTE_RETRIES. It cannot loop: only a quote that
+              // carried an id can be refused, and the id is cleared here.
+              quoteRefreshRefused = false;
               quoteTransactionId = "";
-              setTxId("");
-              setTxError("Quote refreshed. Please approve the fresh request in your wallet.");
               continue;
             }
-            throw error;
+            if (quoteRetries >= MAX_SWAP_QUOTE_RETRIES) throw error;
+            quoteRetries += 1;
+            setTxError("Quote refreshed. Please approve the fresh request in your wallet.");
+            continue;
           }
         }
       }
@@ -1221,8 +1283,12 @@ export default function PayPage() {
       const data = await res.json();
       if (data.rate) {
         const newConverted = parseFloat(req.amount) * data.rate;
+        // This string is what executePay sends, so the rule from fetchRate
+        // applies here above all: a locale formatter would give a comma-decimal
+        // payer "12,34", and the comma strip in executePay would pay 1234.
+        // Same digits as before, just locale-independent.
         const newFormatted = newConverted >= 1
-          ? newConverted.toLocaleString(undefined, { maximumFractionDigits: 2 })
+          ? formatDecimalAmount(newConverted, 2)
           : formatDecimalAmount(newConverted);
         const oldNum = parseFloat(payAmount.replace(/,/g, ""));
         const newNum = newConverted;
@@ -1259,7 +1325,11 @@ export default function PayPage() {
     const invoiceId = `SP-${now.toISOString().slice(0,10).replace(/-/g,"")}${Math.random().toString(36).slice(2,8).toUpperCase()}`;
     const paidAmount = payAmount || req?.amount || "—";
     const paidCoin = selectedCoin?.symbol || req?.payCoin || req?.receiveCoin || "";
-    const receivedAmount = requiresSeraSwap ? (req?.amount || paidAmount) : paidAmount;
+    // A swap settles in the receive coin: the link's fixed amount (the order
+    // total, for a menu checkout) or, for an open-amount link, the figure the
+    // quote recorded. Falling through to paidAmount would print the PAY-coin
+    // number under the receive coin's name.
+    const receivedAmount = requiresSeraSwap ? (req?.amount || swapReceiveAmountRef.current || paidAmount) : paidAmount;
     const receivedCoin = requiresSeraSwap ? (req?.receiveCoin || paidCoin) : paidCoin;
     const referenceAmount = !requiresSeraSwap && req?.amount && req.receiveCoin && req.receiveCoin !== paidCoin
       ? `${req.amount} ${req.receiveCoin}`
@@ -1928,7 +1998,6 @@ export default function PayPage() {
         <CoinSheet
           onClose={() => setShowCoinSheet(false)}
           onSelect={(coin) => {
-            setPayerChangedCoinInCheckout(true);
             setSelectedCoin(coin);
             setRegistryError("");
             setTxError("");

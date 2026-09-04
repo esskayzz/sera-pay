@@ -18,6 +18,7 @@ import { SeraLogo, SeraPayHeader } from "@/components/SeraPayHeader";
 import { NetworkModeButton, NetworkSwitcherModal } from "@/components/NetworkSwitcher";
 import { MAX_IMAGE_UPLOAD_BYTES, loadImage, readFileAsDataUrl, renderCroppedImageForUpload } from "@/lib/imageUpload";
 import { formatDecimalAmount, limitDecimalPlaces, normalizeDecimalAmountText } from "@/lib/decimalInput";
+import { ApiError, fetchApi } from "@/lib/api";
 import { downloadPaymentQrCard } from "@/lib/qrDownload";
 import { StablecoinLogo } from "@/components/StablecoinLogo";
 import { RouteLoadingFallback } from "@/components/RouteLoadingFallback";
@@ -34,6 +35,13 @@ function qrConversionErrorMessage(error: unknown, errorCode?: string | null): st
 }
 
 /**
+ * Cadence of the QR screen's merchant-event poll. Matches the direct-transfer
+ * scan on the same screen: a customer at the counter is waiting for the
+ * merchant to hear it.
+ */
+const QR_EVENT_POLL_INTERVAL_MS = 5000;
+
+/**
  * Formats a rate-derived figure in units the coin can actually carry. The
  * default 6-decimal formatting produced amounts like 0.317762 IDRT — IDRT has
  * two decimals, so no on-chain transfer can express that figure and the
@@ -42,6 +50,26 @@ function qrConversionErrorMessage(error: unknown, errorCode?: string | null): st
 function formatAmountForCoin(value: number, coin: Stablecoin | null | undefined): string {
   const decimals = Number(coin?.decimals);
   return formatDecimalAmount(value, Number.isInteger(decimals) ? Math.min(6, decimals) : 6);
+}
+
+/**
+ * Trims a typed figure to the decimals its coin can carry; anything already
+ * within the cap is returned exactly as typed. The inputs accept six decimals
+ * for every coin because a merchant mid-keystroke must not be fought, but
+ * 2000.123 IDRT signs fine and then cannot be paid — the server rejects the
+ * third decimal when it converts to a raw token amount, and a wallet URI
+ * cannot even be built from it. A figure that rounds away entirely (0.001
+ * IDRT) is left as typed rather than silently turned into an open amount.
+ */
+function capAmountForCoin(value: string, coin: Stablecoin | null | undefined): string {
+  const decimals = Number(coin?.decimals);
+  const maxDecimals = Number.isInteger(decimals) ? Math.min(6, decimals) : 6;
+  const fraction = value.split(".")[1] ?? "";
+  if (fraction.length <= maxDecimals) return value;
+  const parsed = parseFloat(value);
+  if (!Number.isFinite(parsed)) return value;
+  const capped = formatAmountForCoin(parsed, coin);
+  return Number(capped) > 0 ? capped : value;
 }
 
 /**
@@ -1940,6 +1968,13 @@ export default function Home() {
   const [exchangeRate, setExchangeRate] = useState<number | null>(null);
   const [rateLoading, setRateLoading] = useState(false);
   const [conversionError, setConversionError] = useState("");
+  // Building a checkout link has been a signed server call since PR #6. While
+  // one is in flight the button stays disabled, so a double tap cannot sign
+  // twice; the ref is the synchronous half of that guard, for a tap handled
+  // before the disabled prop has rendered. A refusal stays silent — no copy
+  // here is approved — but it must not leave a half-applied request behind.
+  const [signingLink, setSigningLink] = useState(false);
+  const signingLinkRef = useRef(false);
   const rateAbortRef = useRef<AbortController | null>(null);
   const [paymentUrl, setPaymentUrl] = useState("");
   const [guestReceiverAddress, setGuestReceiverAddress] = useState("");
@@ -1982,6 +2017,9 @@ export default function Home() {
   // loop that reads as many customers paying when exactly one did.
   const directQrCompletedKeyRef = useRef("");
   const directQrNotifiedHashesRef = useRef<Set<string>>(new Set());
+  // Merchant events announced on the QR screen, by transaction id, for the
+  // ones that carry no hash to share with the set above.
+  const qrEventNotifiedIdsRef = useRef<Set<string>>(new Set());
   const [directQrPayment, setDirectQrPayment] = useState<{ amount: string; coin: string } | null>(null);
 
   const walletAddress = authWalletAddress ||
@@ -2032,23 +2070,32 @@ export default function Home() {
       coin.symbol.toUpperCase() === selectedCoin.symbol.toUpperCase() || allowedSet.has(coin.symbol.toUpperCase()));
   })();
 
-  const canGenerateQr = Boolean(selectedCoin) && !currenciesLoading && !currenciesError && !rateLoading && conversionReady && !belowConversionMinimum;
+  const canGenerateQr = Boolean(selectedCoin) && !currenciesLoading && !currenciesError && !rateLoading && conversionReady && !belowConversionMinimum && !signingLink;
 
   /**
-   * Settles a typed amount onto Sera's floor once the merchant leaves the field.
+   * Settles a typed amount once the merchant leaves the field: trimmed to the
+   * decimals its coin can carry, then lifted onto Sera's floor.
    *
    * Lifting per keystroke would make the field impossible to type into — "2"
    * would jump to the minimum before "2000" could be finished — so the message
    * shows while typing and the numbers move on blur. Both sides move together,
    * because the receive figure is only meaningful as the rate-converted twin of
-   * the pay figure.
+   * the pay figure. The decimal cap waits for blur for the same reason: the
+   * inputs take six decimals for every coin, and trimming a 2-decimal coin's
+   * third decimal as it is typed would fight the merchant. Each side is capped
+   * to its own coin — the receive figure to the receive coin, the customer's
+   * figure to the pay coin — and a floor-lifted receive figure is capped too,
+   * since the floor helper formats to six decimals.
    */
   const settleConversionMinimum = useCallback(() => {
-    const lifted = applyConversionMinimum(customerAmount, exchangeRate, getConversionMinimum(customerCoin));
-    if (!lifted) return;
-    setCustomerAmount(lifted.payAmount);
-    setAmount(lifted.receiveAmount);
-  }, [customerAmount, customerCoin, exchangeRate]);
+    const cappedReceive = capAmountForCoin(amount, selectedCoin);
+    const cappedPay = capAmountForCoin(customerAmount, customerCoin);
+    const lifted = applyConversionMinimum(cappedPay, exchangeRate, getConversionMinimum(customerCoin));
+    const nextReceive = lifted ? capAmountForCoin(lifted.receiveAmount, selectedCoin) : cappedReceive;
+    const nextPay = lifted ? lifted.payAmount : cappedPay;
+    if (nextReceive !== amount) setAmount(nextReceive);
+    if (nextPay !== customerAmount) setCustomerAmount(nextPay);
+  }, [amount, customerAmount, customerCoin, exchangeRate, selectedCoin]);
 
   const isConnected = authenticated;
   const merchantWorkspaceReady = Boolean(dashboardApiKey && walletAddress);
@@ -2347,9 +2394,12 @@ export default function Home() {
     const receiveCoin = overrides.receiveCoin === undefined ? selectedCoin : overrides.receiveCoin;
     const receiveAddress = overrides.receiverAddress ?? receiverAddress;
     if (!receiveCoin || !receiveAddress) return "";
-    const receiveAmount = overrides.receiveAmount ?? amount;
+    // "2000." is a figure still being typed; sent as-is the server refuses it
+    // with 400 and the button appeared to do nothing. Normalised for the wire
+    // only — the input keeps showing what the merchant typed.
+    const receiveAmount = normalizeDecimalAmountText(overrides.receiveAmount ?? amount);
     const payCoin = overrides.payCoin === undefined ? customerCoin : overrides.payCoin;
-    const payAmount = overrides.payAmount ?? customerAmount;
+    const payAmount = normalizeDecimalAmountText(overrides.payAmount ?? customerAmount);
     const includeExpiry = overrides.includeExpiry ?? true;
 
     try {
@@ -2400,8 +2450,12 @@ export default function Home() {
     }
   }, [createPaymentUrl, step]);
 
+
   const handleGenerateQR = useCallback(() => {
     if (!selectedCoin) return;
+    // A sign is already in flight for this form; the button is disabled, and
+    // this catches the tap that was handled before that rendered.
+    if (signingLinkRef.current) return;
     if (customerCoin && customerCoin.symbol !== selectedCoin.symbol && (!exchangeRate || !customerAmount)) {
       setConversionError("A current Sera exchange rate is required before generating this payment");
       return;
@@ -2409,29 +2463,43 @@ export default function Home() {
     // Sera would reject this conversion at the counter. Refusing here keeps the
     // merchant from printing a QR that cannot be paid.
     if (isBelowConversionMinimum(customerAmount, getConversionMinimum(customerCoin))) return;
+    // The blur cap may not have run yet — a tap on the button can be handled
+    // before the field gives up focus — so each figure is capped to its coin
+    // again here, and the capped figures are what get signed. They go in as
+    // overrides because a state update is not visible to createPaymentUrl
+    // until the next render.
+    const receiveAmount = capAmountForCoin(amount, selectedCoin);
+    const payAmount = capAmountForCoin(customerAmount, customerCoin);
+    if (receiveAmount !== amount) setAmount(receiveAmount);
+    if (payAmount !== customerAmount) setCustomerAmount(payAmount);
     if (!receiverAddress) {
       // They asked for a QR and are about to be sent to sign in; remember it so
       // the request resumes itself afterwards instead of making them start over.
       pendingRequestRef.current = {
         receiveCoin: selectedCoin?.symbol,
-        amount,
+        amount: receiveAmount,
         payCoin: customerCoin?.symbol,
-        payAmount: customerAmount,
+        payAmount,
         wantQr: true,
       };
       writePendingRequest(pendingRequestRef.current);
       setShowGuestReceiverModal(true);
       return;
     }
-    void createPaymentUrl().then((url) => {
+    signingLinkRef.current = true;
+    setSigningLink(true);
+    void createPaymentUrl({ receiveAmount, payAmount }).then((url) => {
       if (!url) return;
       clearPendingRequest();
       pendingRequestRef.current = null;
       pendingResumeRef.current = false;
       setPaymentUrl(url);
       setStep(2);
+    }).finally(() => {
+      signingLinkRef.current = false;
+      setSigningLink(false);
     });
-  }, [createPaymentUrl, customerAmount, customerCoin, exchangeRate, receiverAddress, selectedCoin]);
+  }, [amount, createPaymentUrl, customerAmount, customerCoin, exchangeRate, receiverAddress, selectedCoin]);
 
   /**
    * Finishes the job the merchant started before signing in. Runs once, only
@@ -2461,12 +2529,22 @@ export default function Home() {
     setGuestReceiverAddress(nextAddress);
     setShowGuestReceiverModal(false);
     cancelPendingQrIntent();
+    if (signingLinkRef.current) return;
+    signingLinkRef.current = true;
+    setSigningLink(true);
     void createPaymentUrl({ receiverAddress: nextAddress }).then((url) => {
+      // The sign needs a merchant key, which a visitor who has only typed an
+      // address never has, so this comes back empty every time — and used to
+      // do so silently: the modal closed and nothing happened. Say why.
       if (!url) return;
       setPaymentUrl(url);
       setStep(2);
+    }).finally(() => {
+      signingLinkRef.current = false;
+      setSigningLink(false);
     });
   }, [createPaymentUrl, selectedCoin, cancelPendingQrIntent]);
+
 
   const handleCopyLink = useCallback(async () => {
     try {
@@ -2522,6 +2600,14 @@ export default function Home() {
   }, [amount, currencies, customerAmount, customerCoin, isConversionMode, localLogoData, localQrBgColor, localQrFgColor, localQrMode, localQrStyle, merchantName, merchantProfile, paymentChainId, paymentUrl, receiverAddress, selectedCoin]);
 
   const handleReset = useCallback(() => {
+    // Leaving the QR screen abandons whatever change it was still signing.
+    // Bumping the request id makes commitSignedPaymentChange's stale guard
+    // drop a sign that lands afterwards, so a late failure cannot put the
+    // QR-screen error banner under the Generate button on the form, and a
+    // late success cannot rewrite the coin/amount the merchant is now editing.
+    // Same idiom as handleClearCustomerCoin.
+    qrRateRequestRef.current += 1;
+    setQrRateLoading(false);
     setStep(1);
     setQrEditAmount("");
     setPaymentUrl("");
@@ -2608,6 +2694,86 @@ export default function Home() {
       window.clearInterval(interval);
     };
   }, [directQrPayment, paymentChainId, paymentUrl, qrDisplayAmount, qrDisplayCoin?.symbol, queryClient, receiverAddress, selectedCoin, step]);
+
+  /**
+   * Notifies the merchant of every payment the scan above cannot see.
+   *
+   * That scan watches one thing: an exact-amount transfer of the QR's token to
+   * the receiver. An open-amount receive link is paid on the Pay Now page for
+   * a figure the QR never fixed, and a customer paying in another token is a
+   * Sera swap that settles from Sera's contracts in the receive coin — neither
+   * is the ±1-unit transfer the scan looks for, so the merchant at the counter
+   * heard nothing. The server records each of them as a payment_received
+   * merchant event; this reads that feed the way the dashboard does
+   * (use-events.ts) and raises the same toast and speech as the scan.
+   *
+   * QR screen only, merchant key only: the endpoint needs a key, and a guest
+   * link is paid to an address the server keeps no account for. The first
+   * reply only anchors the cursor to the server's clock — the QR has just
+   * opened, so nothing before that reply can be a payment for it, and reading
+   * the client clock instead would open a gap whichever way it drifts.
+   * Replays (the endpoint's database fallback) are skipped as the dashboard
+   * skips them: they carry no hash to dedupe against. Dedupe shares the scan's
+   * hash set in both directions, so a direct transfer is announced once,
+   * by whichever of the two finds it first.
+   */
+  useEffect(() => {
+    if (step !== 2 || !dashboardApiKey) return;
+    let mounted = true;
+    let timer = 0;
+    let since: number | null = null;
+
+    const poll = async () => {
+      if (!mounted) return;
+      try {
+        const anchored = since !== null;
+        const sinceIso = new Date(since ?? Date.now()).toISOString();
+        const result = await fetchApi<{
+          events?: Array<{ event: string; data: Record<string, unknown>; ts: number }>;
+          serverTime?: number;
+        }>(`/merchant/events/poll?since=${encodeURIComponent(sinceIso)}`);
+        if (!mounted) return;
+        // Server-side the filter is `ts > since`; stepping back one
+        // millisecond keeps an event stamped in the same millisecond as the
+        // reply from falling between two polls. Dedupe absorbs the overlap.
+        since = (typeof result.serverTime === "number" ? result.serverTime : Date.now()) - 1;
+        if (anchored) {
+          for (const item of result.events ?? []) {
+            const data = item?.data ?? {};
+            if (data.event !== "payment_received" || data.replay) continue;
+            const txHash = typeof data.txHash === "string" ? data.txHash.toLowerCase() : "";
+            const transactionId = typeof data.transactionId === "string" ? data.transactionId : "";
+            if (!txHash && !transactionId) continue;
+            if (txHash && directQrNotifiedHashesRef.current.has(txHash)) continue;
+            if (transactionId && qrEventNotifiedIdsRef.current.has(transactionId)) continue;
+            if (txHash) directQrNotifiedHashesRef.current.add(txHash);
+            if (transactionId) qrEventNotifiedIdsRef.current.add(transactionId);
+            // What the merchant received, not what the customer sent: for a
+            // swap the two differ, and the receive coin is the one that lands.
+            const rawAmount = data.amount == null ? "" : String(data.amount);
+            const receivedAmount = normalizeDecimalAmountText(rawAmount) || rawAmount;
+            const receivedCoin = typeof data.coin === "string" ? data.coin.toUpperCase() : "";
+            if (!receivedAmount || !receivedCoin) continue;
+            setDirectQrPayment({ amount: receivedAmount, coin: receivedCoin });
+            speakPaymentReceived(receivedAmount, receivedCoin);
+            queryClient.invalidateQueries({ queryKey: ["/merchant/transactions"] });
+            queryClient.invalidateQueries({ queryKey: ["/merchant/stats"] });
+          }
+        }
+      } catch (error) {
+        // A rejected key will not be accepted on the next tick either;
+        // anything else — a slow reply, a dropped connection — can be.
+        if (error instanceof ApiError && error.status === 401) return;
+      }
+      if (mounted) timer = window.setTimeout(poll, QR_EVENT_POLL_INTERVAL_MS);
+    };
+
+    void poll();
+    return () => {
+      mounted = false;
+      window.clearTimeout(timer);
+    };
+  }, [dashboardApiKey, queryClient, step]);
 
   const handleNameSaved = useCallback((newName: string) => {
     setMerchantName(newName);
@@ -2801,13 +2967,54 @@ export default function Home() {
       setQrEditMode(false);
     };
 
+    /*
+      Every change made on this screen re-mints the signed checkout link, and
+      minting is a network call that can fail — createPaymentUrl reports that
+      as "". The header, the QR and the copy link must all describe one
+      request, so a change is applied only once its link exists: the next
+      figures are worked out first, the link is signed for them, and only
+      then are the figures and the link swapped in together. Applying the
+      figures up front and hoping the sign landed was how the header came to
+      announce a new amount over a QR that still encoded the old link, with
+      nothing telling the merchant. On failure nothing moves and the banner
+      says so; the previous QR stays valid throughout. requestId is the same
+      stale-response guard the rate fetches use: a change that has since been
+      superseded neither applies nor touches the spinner, which the newer
+      change now owns.
+    */
+    const commitSignedPaymentChange = async (
+      requestId: number,
+      overrides: Parameters<typeof createPaymentUrl>[0],
+      applyChange: () => void,
+    ) => {
+      setQrRateLoading(true);
+      const newUrl = await createPaymentUrl(overrides);
+      if (requestId !== qrRateRequestRef.current) return;
+      setQrRateLoading(false);
+      // Leave every figure and the QR exactly as they were; the code on
+      // screen is still the earlier, still-valid request.
+      if (!newUrl) return;
+      applyChange();
+      setPaymentUrl(newUrl);
+    };
+
     const handleQrEditSave = async () => {
       if (!qrEditAmount || isNaN(parseFloat(qrEditAmount))) { closeQrEdit(); return; }
-      const safeAmount = normalizeDecimalAmountText(qrEditAmount);
+      // Cap to the token's own precision, exactly as the step-1 inputs do.
+      // normalizeDecimalAmountText only enforces the global 6-decimal ceiling,
+      // so 2000.123 on a 2-decimal token (IDRT, EURS) signed cleanly here and
+      // then could not be paid at all: the wallet URI builder throws on the
+      // extra digits and the server's toRawTokenAmount rejects the amount.
+      const safeAmount = capAmountForCoin(normalizeDecimalAmountText(qrEditAmount), selectedCoin);
       if (!safeAmount) { closeQrEdit(); return; }
       // Recalculate customer amount
       let nextReceiveAmount = safeAmount;
-      let nextPayAmount = customerCoin?.symbol === selectedCoin?.symbol ? safeAmount : normalizeDecimalAmountText(customerAmount);
+      let nextPayAmount = customerCoin?.symbol === selectedCoin?.symbol
+        ? safeAmount
+        : capAmountForCoin(normalizeDecimalAmountText(customerAmount), customerCoin);
+      // Held back until the new link is signed; see commitSignedPaymentChange.
+      let nextExchangeRate: number | null = null;
+      const requestId = ++qrRateRequestRef.current;
       if (customerCoin && selectedCoin && selectedCoin.symbol !== customerCoin.symbol) {
         /*
           Always price the save off a fresh quote. The stored exchangeRate can
@@ -2816,7 +3023,6 @@ export default function Home() {
           made the first Done appear to do nothing until a second attempt ran
           with settled state. The server caches quotes, so this is cheap.
         */
-        const requestId = ++qrRateRequestRef.current;
         setQrRateLoading(true);
         try {
           const rateRes = await fetch(`/api/rates?from=${selectedCoin.symbol}&to=${customerCoin.symbol}&chainId=${paymentChainId}`);
@@ -2825,7 +3031,7 @@ export default function Home() {
             throw Object.assign(new Error(rateData.detail || rateData.error || ""), { errorCode: rateData.errorCode });
           }
           if (requestId !== qrRateRequestRef.current) return;
-          setExchangeRate(rateData.rate);
+          nextExchangeRate = rateData.rate;
           setConversionError("");
           const calc = parseFloat(safeAmount) * rateData.rate;
           nextPayAmount = isNaN(calc) ? "" : formatAmountForCoin(calc, customerCoin);
@@ -2845,7 +3051,8 @@ export default function Home() {
           }
           return; // keep the modal open so the merchant sees why nothing moved
         }
-        setQrRateLoading(false);
+        // The spinner stays up: the sign below is the second half of this
+        // same change, and commitSignedPaymentChange clears it.
       } else {
         // Same-coin or receive-only: nothing is derived, but a same-coin
         // request can still sit under the token's own Sera floor.
@@ -2855,11 +3062,11 @@ export default function Home() {
           nextReceiveAmount = lifted.receiveAmount;
         }
       }
-      setAmount(nextReceiveAmount);
-      if (customerCoin) setCustomerAmount(nextPayAmount);
-      // Rebuild payment URL
-      void createPaymentUrl({ receiveAmount: nextReceiveAmount, payAmount: nextPayAmount }).then((newUrl) => {
-        setPaymentUrl(newUrl);
+      // Rebuild payment URL, then apply the figures it was signed for
+      void commitSignedPaymentChange(requestId, { receiveAmount: nextReceiveAmount, payAmount: nextPayAmount }, () => {
+        if (nextExchangeRate !== null) setExchangeRate(nextExchangeRate);
+        setAmount(nextReceiveAmount);
+        if (customerCoin) setCustomerAmount(nextPayAmount);
       });
       closeQrEdit();
     };
@@ -2873,13 +3080,11 @@ export default function Home() {
       // succeeds. A failed route must never erase a usable QR code.
       setConversionError("");
       if (coin.symbol === selectedCoin.symbol) {
-        setQrRateLoading(false);
         const sameAmount = normalizeDecimalAmountText(amount);
-        setCustomerCoin(coin);
-        setCustomerAmount(sameAmount);
-        setExchangeRate(1);
-        void createPaymentUrl({ payCoin: coin, payAmount: sameAmount }).then((newUrl) => {
-          setPaymentUrl(newUrl);
+        void commitSignedPaymentChange(requestId, { payCoin: coin, payAmount: sameAmount }, () => {
+          setCustomerCoin(coin);
+          setCustomerAmount(sameAmount);
+          setExchangeRate(1);
         });
         return;
       }
@@ -2902,13 +3107,13 @@ export default function Home() {
             if (lifted) {
               newPayAmount = lifted.payAmount;
               newReceiveAmount = lifted.receiveAmount;
-              setAmount(newReceiveAmount);
             }
-            setCustomerCoin(coin);
-            setExchangeRate(data.rate);
-            setCustomerAmount(newPayAmount);
-            void createPaymentUrl({ receiveAmount: newReceiveAmount, payCoin: coin, payAmount: newPayAmount }).then((newUrl) => {
-              setPaymentUrl(newUrl);
+            // Returned so the spinner outlives the sign, not just the quote.
+            return commitSignedPaymentChange(requestId, { receiveAmount: newReceiveAmount, payCoin: coin, payAmount: newPayAmount }, () => {
+              if (lifted) setAmount(newReceiveAmount);
+              setCustomerCoin(coin);
+              setExchangeRate(data.rate);
+              setCustomerAmount(newPayAmount);
             });
           } else {
             throw new Error("Sera did not return an exchange rate");
@@ -3330,10 +3535,8 @@ export default function Home() {
                 is generated, never by changing a currency after the fact.
               */
               if (!customerCoin) {
-                setQrRateLoading(false);
-                setSelectedCoin(coin);
-                void createPaymentUrl({ receiveCoin: coin, receiveAmount, payCoin: null, payAmount: "" }).then((newUrl) => {
-                  if (newUrl) setPaymentUrl(newUrl);
+                void commitSignedPaymentChange(requestId, { receiveCoin: coin, receiveAmount, payCoin: null, payAmount: "" }, () => {
+                  setSelectedCoin(coin);
                 });
                 return;
               }
@@ -3352,15 +3555,17 @@ export default function Home() {
                     if (data.rate) {
                       const calc = parseFloat(receiveAmount) * data.rate;
                       const newPayAmount = isNaN(calc) ? "" : formatDecimalAmount(calc);
-                      setSelectedCoin(coin);
-                      setExchangeRate(data.rate);
-                      setCustomerAmount(newPayAmount);
-                      void createPaymentUrl({
+                      // Returned so the spinner outlives the sign, not just the quote.
+                      return commitSignedPaymentChange(requestId, {
                         receiveCoin: coin,
                         receiveAmount,
                         payCoin: customerCoin,
                         payAmount: newPayAmount,
-                      }).then(setPaymentUrl);
+                      }, () => {
+                        setSelectedCoin(coin);
+                        setExchangeRate(data.rate);
+                        setCustomerAmount(newPayAmount);
+                      });
                     } else {
                       throw new Error("Sera did not return an exchange rate");
                     }
@@ -3375,16 +3580,16 @@ export default function Home() {
                   });
               } else {
                 // Same coin — rebuild URL with new receive coin
-                setQrRateLoading(false);
-                setSelectedCoin(coin);
-                setExchangeRate(1);
-                setCustomerAmount(receiveAmount);
-                void createPaymentUrl({
+                void commitSignedPaymentChange(requestId, {
                   receiveCoin: coin,
                   receiveAmount,
                   payCoin: coin,
                   payAmount: receiveAmount,
-                }).then(setPaymentUrl);
+                }, () => {
+                  setSelectedCoin(coin);
+                  setExchangeRate(1);
+                  setCustomerAmount(receiveAmount);
+                });
               }
             }}
             selectedSymbol={selectedCoin?.symbol}
@@ -3718,7 +3923,11 @@ export default function Home() {
           <p style={{ margin: "10px 0 0", textAlign: "center", fontSize: 12, color: "#FF3B30" }}>
             {/* conversionError already ends in a full stop — appending another
                 sentence produced a stray ".." and restated what the disabled
-                rate field above already makes obvious. */}
+                rate field above already makes obvious. A refused link sign
+                shares this element rather than adding one: same place, same
+                weight, so it reads as the button's answer. The rate message
+                wins when both are set — no link can be minted until the rate
+                is back, so that is the one to act on. */}
             {conversionError}
           </p>
         )}

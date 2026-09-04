@@ -161,6 +161,23 @@ async function startServer() {
   });
 }
 
+/*
+  Last-resort net for a rejected promise nobody caught.
+
+  Express 4 does not catch a rejected async route handler, so one unguarded
+  `await` in any handler is enough for Node to terminate the process by default.
+  On a payment server that means a single database blip can take down every
+  merchant's checkout mid-sale. Individual handlers still catch their own
+  errors — this only stops an oversight from being fatal, and logs it loudly so
+  the real bug still gets fixed. Message only: a driver object can carry the
+  host and credentials.
+*/
+process.on("unhandledRejection", (reason) => {
+  console.error("[fatal] Unhandled promise rejection — request dropped, process kept alive", {
+    reason: reason instanceof Error ? reason.message.slice(0, 300) : String(reason).slice(0, 300),
+  });
+});
+
 startServer().catch((error) => {
   console.error(error);
   process.exitCode = 1;

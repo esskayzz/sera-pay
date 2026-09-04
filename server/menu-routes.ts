@@ -3,11 +3,11 @@
  * Registered under /api/ in server/_core/index.ts
  */
 import { Router } from "express";
-import { createMenuOrder, getDb } from "./db";
+import { createMenuOrder, getApiKeyConfigRecord, getDb } from "./db";
 import { menus, menuItems, merchants, type MenuItem } from "../drizzle/schema";
 import { eq, and, asc, lte, or, isNull } from "drizzle-orm";
 import { v4 as uuidv4 } from "uuid";
-import { requireApiKey } from "./payment-routes";
+import { fetchSeraRate, requireApiKey } from "./payment-routes";
 import { storagePut } from "./storage";
 import { signCheckoutPayload } from "./checkout-payload";
 import { ENV } from "./_core/env";
@@ -105,6 +105,46 @@ function availableMenuItemWhere(menuId: string) {
     eq(menuItems.isActive, 1),
     or(isNull(menuItems.soldOutUntil), lte(menuItems.soldOutUntil, new Date()))
   );
+}
+
+const SERA_MAINNET_CHAIN_ID = 1;
+const SERA_TESTNET_CHAIN_ID = 11155111;
+
+/**
+ * Chain the signed menu checkout pays on. Same rule as normalizeSeraMode in
+ * gateway-routes: a merchant whose Sera API config says "test" resolves to
+ * Sepolia only while the server runs with SERA_ENABLE_TESTNET=true; "live",
+ * the historical "mock", and no config at all are mainnet. The public order
+ * route used to hardcode mainnet, so a merchant in test mode minted menu
+ * checkouts on a network their test tokens were never on.
+ */
+async function checkoutChainIdForMerchant(merchantId: string): Promise<number> {
+  const config = await getApiKeyConfigRecord(merchantId);
+  return config?.mode === "test" && ENV.seraEnableTestnet ? SERA_TESTNET_CHAIN_ID : SERA_MAINNET_CHAIN_ID;
+}
+
+/** Coin symbol the way the rate feed and the Sera registry key it: upper-case, USDC when an item carries none. */
+function coinSymbol(coin: string | null | undefined): string {
+  return String(coin || "USDC").toUpperCase();
+}
+
+/**
+ * Multiplier from each item coin into the checkout coin, one lookup per
+ * distinct coin. A same-coin line is 1 without touching the feed, so a
+ * single-currency order never depends on Sera being reachable. Anything the
+ * feed cannot price — Goldsky down, no Sera market for the pair, a rate that
+ * is not a positive finite number — throws, and the caller refuses the order
+ * rather than guessing a total.
+ */
+async function conversionRatesInto(checkoutCoin: string, itemCoins: string[]): Promise<Map<string, number>> {
+  const rates = new Map<string, number>();
+  for (const itemCoin of new Set(itemCoins)) {
+    if (itemCoin === checkoutCoin) { rates.set(itemCoin, 1); continue; }
+    const rate = await fetchSeraRate(itemCoin, checkoutCoin);
+    if (!Number.isFinite(rate) || rate <= 0) throw new Error(`Invalid Sera rate for ${itemCoin}/${checkoutCoin}: ${rate}`);
+    rates.set(itemCoin, rate);
+  }
+  return rates;
 }
 
 // ── Protected routes (require API key) ───────────────────────────────────────
@@ -425,6 +465,8 @@ menuRouter.post("/public/menu/:slug/orders", async (req, res) => {
     if (!menu) { res.status(404).json({ error: "Menu not found" }); return; }
     await clearExpiredSoldOutItems(db, menu.id);
     const [merchant] = await db.select({
+      name: merchants.name,
+      logoData: merchants.logoData,
       receiveCoin: merchants.receiveCoin,
       walletAddress: merchants.walletAddress,
       storeAddress: merchants.storeAddress,
@@ -455,6 +497,12 @@ menuRouter.post("/public/menu/:slug/orders", async (req, res) => {
     const firstCoin = rows[0].item.coin || "USDC";
     const hasMixedCoins = rows.some((row) => (row.item.coin || "USDC") !== firstCoin);
     const orderCoin = hasMixedCoins ? "MIXED" : firstCoin;
+    // The coin the customer is charged in. A single-currency order keeps the
+    // item coin — it is the price the customer saw on the menu. A mixed order
+    // is paid in the merchant's receive coin; order.coin stays the MIXED
+    // marker so assertMenuOrderBindable maps it onto merchant.receiveCoin at
+    // payment time, the same way it is resolved here.
+    const checkoutCoin = coinSymbol(hasMixedCoins ? (merchant?.receiveCoin || firstCoin) : firstCoin);
 
     const orderItems = rows.map(({ item, qty }) => ({
       id: item.id,
@@ -466,21 +514,56 @@ menuRouter.post("/public/menu/:slug/orders", async (req, res) => {
       qty,
       lineTotal: (Number(item.price) * qty).toFixed(6),
     }));
-    const total = orderItems.reduce((sum, item) => sum + Number(item.lineTotal), 0);
+
+    // Every line is priced in the checkout coin here, server-side, before the
+    // total is stored. The old code summed the raw line totals across whatever
+    // currencies the items were priced in and charged that figure in the
+    // checkout coin: 10 USDC + 15,000 IDRT became "15,010 USDC". The stored
+    // order.amount and the signed checkout amount are the same converted
+    // figure, so the exact amount comparison in assertMenuOrderBindable still
+    // binds the payment to what was stored. Single-currency orders never touch
+    // the rate feed: every line is already in the checkout coin.
+    let rates: Map<string, number>;
+    try {
+      rates = await conversionRatesInto(checkoutCoin, orderItems.map((item) => coinSymbol(item.coin)));
+    } catch (error) {
+      // Refuse the order rather than fall back to the raw cross-currency sum:
+      // an order that cannot be priced must never be charged.
+      console.error(`[menu order] unable to price order in ${checkoutCoin}:`, error);
+      // Names the coin the order could not be priced in, so the customer can
+      // see it is a rate outage rather than a broken cart (owner-approved
+      // wording, 2026-09-04). Refuses rather than charging a raw sum.
+      res.status(503).json({ error: `Unable to price this order in ${checkoutCoin} right now. Please try again in a moment.` });
+      return;
+    }
+    const lineTotalInCheckoutCoin = (item: { coin: string; lineTotal: string }) => {
+      const rate = rates.get(coinSymbol(item.coin));
+      if (rate === undefined) throw new Error(`No conversion rate for ${coinSymbol(item.coin)}/${checkoutCoin}`);
+      return Number(item.lineTotal) * rate;
+    };
+    const total = orderItems.reduce((sum, item) => sum + lineTotalInCheckoutCoin(item), 0);
+    const amount = total.toFixed(6);
+    // Category subtotals are kept in the checkout coin too, so they add up to
+    // order.amount. A category in a mixed order can itself span currencies, so
+    // a raw sum labelled with the MIXED marker was not a figure in any coin.
     const categoryTotals = new Map<string, { name: string; quantity: number; amount: number }>();
     for (const item of orderItems) {
       const category = item.category || "Uncategorised";
       const current = categoryTotals.get(category) || { name: category, quantity: 0, amount: 0 };
       current.quantity += item.qty;
-      current.amount += Number(item.lineTotal);
+      current.amount += lineTotalInCheckoutCoin(item);
       categoryTotals.set(category, current);
     }
     const categoryColumns = Array.from(categoryTotals.values()).slice(0, 6).map((entry) => JSON.stringify({
       name: entry.name,
       quantity: entry.quantity,
       amount: entry.amount.toFixed(6),
-      coin: orderCoin,
+      coin: checkoutCoin,
     }));
+
+    // Resolved before the order row exists: a failed config read must not
+    // leave behind an order that has no checkout link.
+    const chainId = await checkoutChainIdForMerchant(menu.merchantId);
 
     const orderId = uuidv4();
     const resolvedBusinessCategory = menu.businessCategory === "Others"
@@ -500,7 +583,7 @@ menuRouter.post("/public/menu/:slug/orders", async (req, res) => {
       category5: categoryColumns[4] || null,
       category6: categoryColumns[5] || null,
       items: JSON.stringify(orderItems),
-      amount: total.toFixed(6),
+      amount,
       coin: orderCoin,
       orderedAt: new Date(),
     });
@@ -510,12 +593,19 @@ menuRouter.post("/public/menu/:slug/orders", async (req, res) => {
     // refuses unsigned payloads, so a re-encoded menu link cannot redirect or
     // reprice an order.
     const receiveAddress = String(merchant?.storeAddress || merchant?.walletAddress || "").toLowerCase();
-    const checkoutCoin = hasMixedCoins ? (merchant?.receiveCoin || firstCoin) : firstCoin;
+    // merchantName/merchantIcon are what the checkout header shows until its
+    // own /merchant/public fetch lands; without them it opened blank. The
+    // icon cap matches sanitizeCheckoutRequest in payment-routes so a data-URI
+    // logo cannot bloat the link past what a QR or a wallet browser carries.
+    const merchantName = String(merchant?.name || "").trim().slice(0, 120) || undefined;
+    const merchantIcon = typeof merchant?.logoData === "string" && merchant.logoData.length <= 4096 ? merchant.logoData : undefined;
     const encoded = signCheckoutPayload({
       receiverAddress: receiveAddress,
       receiveCoin: checkoutCoin,
-      amount: total.toFixed(6),
-      chainId: 1,
+      amount,
+      chainId,
+      merchantName,
+      merchantIcon,
       orderId,
       menuName: menu.name,
       menuSlug: menu.slug,
@@ -529,8 +619,8 @@ menuRouter.post("/public/menu/:slug/orders", async (req, res) => {
       menuId: menu.id,
       merchantId: menu.merchantId,
       pax,
-      amount: total.toFixed(6),
-      coin: hasMixedCoins ? (merchant?.receiveCoin || firstCoin) : firstCoin,
+      amount,
+      coin: checkoutCoin,
       items: orderItems,
       status: "created",
       checkout: { encoded, paymentUrl: `${publicBaseUrl(req)}/pay/${encoded}` },

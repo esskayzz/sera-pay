@@ -199,6 +199,11 @@ async function sweep(baseUrl?: string) {
 }
 
 export function refreshPairLiquidity(baseUrl?: string) {
+  // The flag has to gate the work itself, not just the background timer.
+  // GET /api/sera/pairs calls this on demand and the currency picker hits that
+  // route on every page load — so with the check only on the timer, the sweep
+  // this flag exists to hold back ran anyway, from the first visitor.
+  if (!SWEEP_ENABLED) return;
   if (checkedAt !== null && Date.now() - checkedAt < REFRESH_MS) return;
   void sweep(baseUrl);
 }

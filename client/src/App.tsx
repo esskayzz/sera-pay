@@ -160,6 +160,12 @@ function App() {
         clientId={privyConfig.clientId || undefined}
         config={{
           loginMethods: ["wallet", "email", "google", "twitter", "telegram"],
+          // Only override when we actually have our own project; an empty
+          // string would be sent to the relay as a project id and rejected,
+          // which is worse than Privy's shared default.
+          ...(privyConfig.walletConnectCloudProjectId
+            ? { walletConnectCloudProjectId: privyConfig.walletConnectCloudProjectId }
+            : {}),
           appearance: {
             theme: "light",
             accentColor: "#00C853",

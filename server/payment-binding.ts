@@ -46,8 +46,29 @@ export function amountAtLeast(amount: string, required: string): boolean {
 
 function toMicroAmount(value: string): number | null {
   const normalized = String(value ?? "").replace(/,/g, "").trim();
-  if (!/^\d+(\.\d{1,6})?$/.test(normalized)) return null;
-  return Math.round(Number(normalized) * 1_000_000);
+  /*
+    Accept any number of fractional digits, then compare at the 6dp scale.
+
+    The old form capped the fraction at six digits, which quietly broke every
+    payment-intent binding: payment_intents.amount is numeric(36,18), and
+    node-postgres returns numeric as the text Postgres emits — so a stored
+    "100.50" reads back as "100.500000000000000000". Eighteen digits failed the
+    cap, this returned null, and both comparators short-circuited to false, so
+    assertAmountMatchesReference rejected the payment it was meant to authorise.
+    Menu orders escaped only because that column is numeric(20,6).
+
+    Digits past the sixth are still not allowed to change the value: anything
+    non-zero beyond 6dp is a genuinely different amount and must not silently
+    round into a match.
+  */
+  const match = /^(\d+)(?:\.(\d*))?$/.exec(normalized);
+  if (!match) return null;
+  const fraction = match[2] ?? "";
+  const micros = fraction.slice(0, 6).padEnd(6, "0");
+  if (/[^0]/.test(fraction.slice(6))) return null;
+  const whole = Number(match[1]);
+  const value6 = whole * 1_000_000 + Number(micros);
+  return Number.isSafeInteger(value6) ? value6 : null;
 }
 
 /**

@@ -234,8 +234,10 @@ function DashboardPaymentModal({
     return duration > 0 ? expiryNow + duration : undefined;
   }, [expiryNow, expiryOption]);
   // The checkout link is signed server-side, so it is fetched rather than
-  // encoded locally. The effect re-signs whenever the request actually changes;
-  // a signing failure renders as "no link" instead of an unsigned one.
+  // encoded locally. The effect re-signs whenever the request actually changes,
+  // but every keystroke changes the request and each sign is a server round
+  // trip, so it waits for the merchant to pause before sending one. A signing
+  // failure never falls back to an unsigned link.
   const paymentUrlRequest = React.useMemo(() => ({
     receiverAddress,
     receiveCoin: resolvedReceiveCoin,
@@ -250,13 +252,44 @@ function DashboardPaymentModal({
     singleUse: singleUse || undefined,
   }), [chainId, description, displayPayAmount, expiresAt, logo, merchantName, receiveAmount, receiverAddress, resolvedPayCoin, resolvedReceiveCoin, singleUse]);
   const [paymentUrl, setPaymentUrl] = React.useState("");
+  // Id of the newest sign request. A response applies only while its id is
+  // still current, so a slow early sign can never overwrite a later one and a
+  // sign superseded while in flight is dropped instead of shown.
+  const signRequestIdRef = React.useRef(0);
+  // Mirrors paymentUrl for the sign callbacks, which must not close over it:
+  // listing paymentUrl as a dependency would re-run the effect after every
+  // successful sign and mint the same link again.
+  const lastSignedUrlRef = React.useRef("");
   React.useEffect(() => {
-    if (!receiverAddress || !conversionReady) { setPaymentUrl(""); return; }
-    let cancelled = false;
-    requestSignedPaymentUrl(paymentUrlRequest)
-      .then((url) => { if (!cancelled) setPaymentUrl(url); })
-      .catch(() => { if (!cancelled) setPaymentUrl(""); });
-    return () => { cancelled = true; };
+    if (!receiverAddress || !conversionReady) {
+      lastSignedUrlRef.current = "";
+      setPaymentUrl("");
+      return;
+    }
+    const requestId = ++signRequestIdRef.current;
+    // The previous link stays on screen until the new one arrives: swapping it
+    // in place keeps the QR from blinking out on every edit. It is blanked only
+    // above, when the inputs no longer describe a payable request.
+    const timer = window.setTimeout(() => {
+      requestSignedPaymentUrl(paymentUrlRequest)
+        .then((url) => {
+          if (signRequestIdRef.current !== requestId) return;
+          if (!url) throw new Error("Checkout signing returned no link");
+          lastSignedUrlRef.current = url;
+          setPaymentUrl(url);
+        })
+        .catch(() => {
+          if (signRequestIdRef.current !== requestId) return;
+          // A failed re-sign keeps the last good link rather than hiding the
+          // QR, which would leave the modal looking empty for no visible
+          // reason. Silent by design: no copy for this state is approved.
+        });
+    }, 400);
+    return () => {
+      window.clearTimeout(timer);
+      // Superseded or unmounted: a response for this id must not land.
+      signRequestIdRef.current += 1;
+    };
   }, [paymentUrlRequest, conversionReady, receiverAddress]);
   const paymentQrValue = React.useMemo(() => receiverAddress && paymentUrl ? buildPaymentQrValue({
     receiverAddress,

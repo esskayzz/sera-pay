@@ -26,7 +26,7 @@ import {
   updateSubWallet,
   upsertApiKeyConfig,
 } from "./db";
-import { requireApiKey } from "./payment-routes";
+import { isUnpaidDirectQrWatch, requireApiKey } from "./payment-routes";
 import { screenWalletAddress } from "./compliance";
 import { decryptSecret, encryptSecret, isSecretEncryptionReady, maskSecret } from "./secret-vault";
 import { signCheckoutPayload } from "./checkout-payload";
@@ -855,7 +855,13 @@ gatewayRouter.get("/transactions", requireApiKey as any, async (req: any, res) =
   try {
     const limit = Math.min(Number(req.query.limit) || 100, 1000);
     const offset = Number(req.query.offset) || 0;
-    const transactions = await getMerchantTransactions(req.merchant.id, limit, offset);
+    const rows = await getMerchantTransactions(req.merchant.id, limit, offset);
+    // Scan & Pay mints a placeholder row so the 60s sweep keeps watching a QR
+    // after the merchant closes the screen. It is bookkeeping, not a payment:
+    // no hash, no money. The dashboard routes already hide these, and an API
+    // integrator polling this endpoint must not see phantom pending/canceled
+    // transactions either.
+    const transactions = rows.filter((tx) => !isUnpaidDirectQrWatch(tx));
     res.json({ transactions, pagination: { limit, offset } });
   } catch (error) {
     safeGatewayLog("transactions", error);

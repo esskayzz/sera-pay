@@ -4,8 +4,9 @@
  */
 import { Router, Request, Response } from "express";
 import crypto from "crypto";
+import { assertPublicHttpUrl, UrlGuardError } from "./url-guard";
 import { v4 as uuidv4 } from "uuid";
-import { createPublicClient, fallback, http, webSocket, parseAbi, parseAbiItem, decodeEventLog, keccak256, toHex, encodeAbiParameters, parseAbiParameters, verifyMessage } from "viem";
+import { createPublicClient, fallback, http, webSocket, parseAbi, parseAbiItem, decodeEventLog, verifyMessage } from "viem";
 import { sepolia, mainnet } from "viem/chains";
 import {
   getMerchantByWallet,
@@ -525,6 +526,19 @@ paymentRouter.post("/merchant/webhook", requireApiKey as any, async (req: any, r
     if (webhookUrl !== undefined && webhookUrl !== null && (typeof webhookUrl !== "string" || !/^https:\/\//.test(webhookUrl))) {
       res.status(400).json({ error: "webhookUrl must be an HTTPS URL" }); return;
     }
+    // SSRF: delivery and webhook/test both run this guard and fail closed, so
+    // an internal URL was never actually fetched — but a merchant who saved one
+    // got a success response and then silence on every payment. Reject it at
+    // save time so the mistake surfaces when it is made, not weeks later in a
+    // webhook log. Clearing the URL (null/empty) has nothing to resolve.
+    if (typeof webhookUrl === "string" && webhookUrl) {
+      try {
+        await assertPublicHttpUrl(webhookUrl);
+      } catch (guardErr) {
+        if (guardErr instanceof UrlGuardError) { res.status(guardErr.status).json({ error: guardErr.message }); return; }
+        throw guardErr;
+      }
+    }
     await updateMerchant(req.merchant.id, { webhookUrl: webhookUrl || null });
     res.json({ success: true, webhookUrl: webhookUrl || null });
   } catch (e) { logSeraOperationFailure("payment-route", e); res.status(500).json({ error: "Internal server error" }); }
@@ -550,25 +564,15 @@ paymentRouter.post("/merchant/webhook/test", requireApiKey as any, async (req: a
       timestamp: new Date().toISOString(),
     };
 
-    // SSRF protection: block private/local hostnames and IP ranges
-    const urlObj = new URL(targetUrl);
-    const hostname = urlObj.hostname.toLowerCase();
-    const privatePatterns = [
-      /^localhost$/i,
-      /\.local$/i,          // *.local mDNS
-      /^127\./,             // IPv4 loopback
-      /^0\.0\.0\.0$/,
-      /^10\./,              // RFC1918 class A
-      /^172\.(1[6-9]|2\d|3[01])\./,  // RFC1918 class B
-      /^192\.168\./,        // RFC1918 class C
-      /^169\.254\./,        // link-local
-      /^::1$/,              // IPv6 loopback
-      /^fc[0-9a-f]{2}:/i,   // IPv6 ULA
-      /^fe80:/i,            // IPv6 link-local
-      /^\[::1\]$/,          // IPv6 loopback bracket form
-    ];
-    if (privatePatterns.some(p => p.test(hostname))) {
-      res.status(400).json({ error: "Private/local URLs are not allowed for security reasons" }); return;
+    // SSRF: resolve the host and refuse any private/internal address. Checking
+    // the resolved IPs (not the hostname string) also defeats DNS rebinding,
+    // and the shared guard covers the Tailscale CGNAT range and alternate IP
+    // encodings the old inline list missed.
+    try {
+      await assertPublicHttpUrl(targetUrl);
+    } catch (guardErr) {
+      if (guardErr instanceof UrlGuardError) { res.status(guardErr.status).json({ error: guardErr.message }); return; }
+      throw guardErr;
     }
 
     const body = JSON.stringify(samplePayload);
@@ -582,7 +586,17 @@ paymentRouter.post("/merchant/webhook/test", requireApiKey as any, async (req: a
     let statusCode = 0;
     let responseBody = "";
     try {
-      const resp = await fetch(targetUrl, { method: "POST", headers, body, signal: AbortSignal.timeout(10000) });
+      // redirect:"manual" is load-bearing, not a nicety. The guard above vetted
+      // the addresses this URL resolves to, but fetch follows a 3xx by default
+      // and resolves the Location itself — so a merchant could name a public
+      // host that simply redirects to 169.254.169.254 or a Tailnet address and
+      // walk straight past the check. A webhook endpoint has no legitimate
+      // reason to redirect, so a 3xx is a failed delivery, not something to follow.
+      const resp = await fetch(targetUrl, { method: "POST", headers, body, redirect: "manual", signal: AbortSignal.timeout(10000) });
+      if (resp.status >= 300 && resp.status < 400) {
+        res.status(400).json({ error: "Webhook endpoint redirected; redirects are not allowed" });
+        return;
+      }
       statusCode = resp.status;
       responseBody = await resp.text().catch(() => "");
     } catch (fetchErr: any) {
@@ -634,6 +648,9 @@ paymentRouter.get("/merchant/stats", requireApiKey as any, async (req: any, res)
     let txs = await getMerchantTransactions(req.merchant.id, 1000);
     const canceled = await cancelStaleMerchantTransactions(req.merchant.id, txs);
     if (canceled > 0) txs = await getMerchantTransactions(req.merchant.id, 1000);
+    // Unpaid Scan & Pay watch rows are the sweep's bookkeeping, not payments;
+    // counting them would inflate pending/unverified with every QR shown.
+    txs = txs.filter((tx) => !isUnpaidDirectQrWatch(tx));
     if (Number.isInteger(requestedChainId) && requestedChainId > 0) {
       txs = txs.filter((tx) => Number(tx.chainId ?? SERA_MAINNET_CHAIN_ID) === requestedChainId);
     }
@@ -717,53 +734,64 @@ export function notifyMerchantSse(merchantId: string, data: Record<string, unkno
  *  Accepts API key via X-Api-Key header (preferred) or apiKey query param (legacy, logged as warning).
  */
 paymentRouter.get("/merchant/events", async (req, res) => {
-  // Auth: accept short-lived SSE token (preferred), X-Api-Key header, or legacy query param
-  const sseToken = req.query.token as string | undefined;
-  let merchantId: string | undefined;
-  if (sseToken) {
-    const entry = sseTokens.get(sseToken);
-    if (!entry || entry.expiresAt < Date.now()) {
-      res.status(401).json({ error: "Invalid or expired SSE token" }); return;
-    }
-    merchantId = entry.merchantId;
-    sseTokens.delete(sseToken); // one-time use
-  } else {
-    const apiKey = (req.headers["x-api-key"] as string) || (req.query.apiKey as string);
-    if (!apiKey) { res.status(401).json({ error: "Missing authentication" }); return; }
-    const merchant = await getMerchantByApiKey(apiKey);
-    if (!merchant) { res.status(401).json({ error: "Invalid API key" }); return; }
-    merchantId = merchant.id;
-  }
-  const merchant = await getMerchantById(merchantId!);
-  if (!merchant) { res.status(401).json({ error: "Merchant not found" }); return; }
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
-  res.flushHeaders();
-  res.write(`data: ${JSON.stringify({ event: "connected", merchantId: merchant.id })}\n\n`);
-  if (!merchantSseClients.has(merchant.id)) merchantSseClients.set(merchant.id, new Set());
-  merchantSseClients.get(merchant.id)!.add(res);
-  // Send recent confirmed transactions as replay
-  const since = req.query.since as string;
-  if (since) {
-    try {
-      const sinceDate = new Date(since);
-      const recent = await getMerchantTransactions(merchant.id, 20);
-      for (const tx of recent) {
-        if (new Date(tx.createdAt) > sinceDate && tx.status === "confirmed") {
-          res.write(`data: ${JSON.stringify({ event: "payment_received", transactionId: tx.id, amount: tx.amount, coin: tx.coin, from: tx.fromAddress, replay: true })}\n\n`);
-        }
+  // Express 4 does not catch a rejected async handler, and this one awaits the
+  // database twice before it streams anything. Unguarded, a single DB blip
+  // here became an unhandled rejection and took the whole payment server down.
+  try {
+    // Auth: accept short-lived SSE token (preferred), X-Api-Key header, or legacy query param
+    const sseToken = req.query.token as string | undefined;
+    let merchantId: string | undefined;
+    if (sseToken) {
+      const entry = sseTokens.get(sseToken);
+      if (!entry || entry.expiresAt < Date.now()) {
+        res.status(401).json({ error: "Invalid or expired SSE token" }); return;
       }
-    } catch {}
+      merchantId = entry.merchantId;
+      sseTokens.delete(sseToken); // one-time use
+    } else {
+      const apiKey = (req.headers["x-api-key"] as string) || (req.query.apiKey as string);
+      if (!apiKey) { res.status(401).json({ error: "Missing authentication" }); return; }
+      const merchant = await getMerchantByApiKey(apiKey);
+      if (!merchant) { res.status(401).json({ error: "Invalid API key" }); return; }
+      merchantId = merchant.id;
+    }
+    const merchant = await getMerchantById(merchantId!);
+    if (!merchant) { res.status(401).json({ error: "Merchant not found" }); return; }
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+    res.write(`data: ${JSON.stringify({ event: "connected", merchantId: merchant.id })}\n\n`);
+    if (!merchantSseClients.has(merchant.id)) merchantSseClients.set(merchant.id, new Set());
+    merchantSseClients.get(merchant.id)!.add(res);
+    // Send recent confirmed transactions as replay
+    const since = req.query.since as string;
+    if (since) {
+      try {
+        const sinceDate = new Date(since);
+        const recent = await getMerchantTransactions(merchant.id, 20);
+        for (const tx of recent) {
+          if (new Date(tx.createdAt) > sinceDate && tx.status === "confirmed") {
+            res.write(`data: ${JSON.stringify({ event: "payment_received", transactionId: tx.id, amount: tx.amount, coin: tx.coin, from: tx.fromAddress, replay: true })}\n\n`);
+          }
+        }
+      } catch {}
+    }
+    // Heartbeat every 25s
+    const heartbeat = setInterval(() => { try { res.write(": heartbeat\n\n"); } catch { clearInterval(heartbeat); } }, 25000);
+    req.on("close", () => {
+      clearInterval(heartbeat);
+      merchantSseClients.get(merchant.id)?.delete(res);
+      if (merchantSseClients.get(merchant.id)?.size === 0) merchantSseClients.delete(merchant.id);
+    });
+  } catch (e) {
+    logSeraOperationFailure("merchant/events", e);
+    // The stream may already be open, in which case the headers are gone and
+    // ending it so the client reconnects is the only correct move left.
+    if (!res.headersSent) res.status(503).json({ error: "Event stream is temporarily unavailable. Please retry." });
+    else { try { res.end(); } catch {} }
   }
-  // Heartbeat every 25s
-  const heartbeat = setInterval(() => { try { res.write(": heartbeat\n\n"); } catch { clearInterval(heartbeat); } }, 25000);
-  req.on("close", () => {
-    clearInterval(heartbeat);
-    merchantSseClients.get(merchant.id)?.delete(res);
-    if (merchantSseClients.get(merchant.id)?.size === 0) merchantSseClients.delete(merchant.id);
-  });
 });
 
 /** GET /api/merchant/events/poll — polling fallback for Cloudflare environments
@@ -806,6 +834,10 @@ paymentRouter.get("/merchant/transactions", requireApiKey as any, async (req: an
     let txs = await getMerchantTransactions(req.merchant.id, limit, offset);
     const canceled = await cancelStaleMerchantTransactions(req.merchant.id, txs);
     if (canceled > 0) txs = await getMerchantTransactions(req.merchant.id, limit, offset);
+    // Unpaid Scan & Pay watch rows are the sweep's bookkeeping, not payments
+    // the merchant made or a customer began; they show only once a transfer
+    // confirms them (see isUnpaidDirectQrWatch).
+    txs = txs.filter((tx) => !isUnpaidDirectQrWatch(tx));
     if (Number.isInteger(requestedChainId) && requestedChainId > 0) {
       txs = txs.filter((tx) => Number(tx.chainId ?? SERA_MAINNET_CHAIN_ID) === requestedChainId);
     }
@@ -1129,6 +1161,15 @@ async function cancelStaleMerchantTransactions(merchantId: string, transactions?
     // "confirming" means a wallet transaction or Sera trade was already
     // submitted. Never auto-cancel submitted money just because settlement is slow.
     if (tx.status === "pending" && new Date(tx.createdAt).getTime() <= cutoff) {
+      if (isDirectQrWatchTransaction(tx)) {
+        // A Scan & Pay watch row stands for a QR nobody paid, not for a
+        // customer who walked away mid-payment. Expire it so the sweep stops
+        // scanning for it, but without transaction_auto_canceled: that event
+        // is the dashboard's "a payment was abandoned" toast, and a merchant
+        // who merely left the QR screen has nothing to be told.
+        if (await expireDirectQrWatch(tx)) canceled += 1;
+        continue;
+      }
       if (await cancelTransactionRecord(tx, "Auto-canceled after 5 minutes without payment confirmation.", "transaction_auto_canceled")) {
         canceled += 1;
       }
@@ -1309,7 +1350,10 @@ async function reconcileSeraSwapTransaction(tx: Transaction): Promise<Transactio
     return tx;
   }
   const tradeId = typeof notes.tradeId === "string" ? notes.tradeId : null;
-  if (notes.type !== "sera_swap" || !tradeId) return tx;
+  if (notes.type !== "sera_swap") return tx;
+  // A submit whose answer was lost in transit (see /payment/swap/submit) has
+  // no trade id to ask Sera about; the chain is the only witness left.
+  if (!tradeId) return reconcileSeraSwapOnChain(tx, notes);
 
   const config = await getApiKeyConfigRecord(tx.merchantId).catch(() => undefined);
   const credential = decryptSecret(config?.seraApiKeyEncrypted) || ENV.seraApiKey || "";
@@ -1475,6 +1519,14 @@ function bindCheckoutRequest(raw: unknown): Record<string, any> | null {
   if (!COIN_SYMBOL_RE.test(String(request.receiveCoin || ""))) {
     throw new CheckoutPayloadError("Checkout link has an invalid currency");
   }
+  // Enforce the link's own expiry on the server. The checkout page already
+  // refuses an expired link, but that is only a client-side courtesy — a
+  // request made straight to this endpoint bypassed it entirely and an expired
+  // link stayed payable. Signed into the payload, so a payer cannot extend it.
+  const expiresAt = Number(request.expiresAt);
+  if (Number.isFinite(expiresAt) && expiresAt > 0 && Date.now() > expiresAt) {
+    throw new CheckoutPayloadError("This checkout link has expired. Ask the merchant for a fresh link.", 410);
+  }
   return request;
 }
 
@@ -1506,6 +1558,18 @@ function sanitizeCheckoutRequest(input: any): Record<string, unknown> | null {
     }
   } catch {
     return null;
+  }
+  // payCoin is the "Customer Pays" token the merchant set alongside payAmount.
+  // It is a display preset only: the checkout uses it to pre-select the pay
+  // token and to fire the express wallet connect on Scan & Pay links. No
+  // server route reads it to move money — /payment/create takes the coin from
+  // the request body and /payment/swap/quote from req.body.payCoin, and both
+  // stay bound to the signed receiveCoin/amount. Dropping it here meant every
+  // conversion-mode link opened on the receive coin instead of the coin the
+  // merchant had just quoted the customer.
+  if (typeof input.payCoin === "string") {
+    const payCoin = input.payCoin.trim().toUpperCase();
+    if (COIN_SYMBOL_RE.test(payCoin)) payload.payCoin = payCoin;
   }
   const chainId = Number(input.chainId ?? SERA_MAINNET_CHAIN_ID);
   if (chainId !== SERA_MAINNET_CHAIN_ID && !isTestnetChainEnabled(chainId)) return null;
@@ -1574,6 +1638,27 @@ paymentRouter.post("/payment/create", async (req, res) => {
     const checkoutRequest = bindCheckoutRequest(req.body.checkoutPayload);
     const merchantAddress = String(checkoutRequest?.receiverAddress ?? req.body.merchantAddress ?? "");
     const coin = String(checkoutRequest?.receiveCoin ?? req.body.coin ?? "");
+    // The signed payload's receiveCoin is authoritative for a direct transfer
+    // and the body cannot override it. A body coin that differs is not a
+    // forgery though — it is the checkout paying in another token, which is a
+    // Sera swap and belongs on /payment/swap/quote, never here. Silently
+    // substituting the receive coin returned the wrong token address, the
+    // checkout's consistency check threw, and the pending row inserted below
+    // sat orphaned until the 5-minute auto-cancel woke the merchant for a
+    // payment that never began. Refuse before anything is screened, resolved
+    // or written.
+    const requestedCoin = typeof req.body.coin === "string" ? req.body.coin.trim().toUpperCase() : "";
+    if (checkoutRequest && requestedCoin && requestedCoin !== String(checkoutRequest.receiveCoin)) {
+      // Cross-coin settles through /payment/swap/*, so a direct create naming
+      // another coin is a stale page or a raw API call. Says which currency the
+      // link is priced in rather than a bare "Invalid coin", because the payer
+      // can act on that (owner-approved wording, 2026-09-04).
+      const requestedLabel = COIN_SYMBOL_RE.test(requestedCoin) ? requestedCoin : "another currency";
+      res.status(400).json({
+        error: `This checkout is priced in ${checkoutRequest.receiveCoin}. Paying in ${requestedLabel} goes through a swap — refresh the page and try again.`,
+      });
+      return;
+    }
     const amount = checkoutRequest?.amount ?? req.body.amount;
     const chainId = checkoutRequest ? checkoutRequest.chainId : req.body.chainId;
     const orderId = typeof (checkoutRequest?.orderId ?? req.body.orderId) === "string"
@@ -1940,9 +2025,47 @@ paymentRouter.post("/payment/swap/quote", async (req, res) => {
   }
 });
 
+/**
+ * Sera matches and may settle the order inside POST /swap itself, so the 8s
+ * default in callSeraApi regularly fired after Sera had accepted the order.
+ * Give settlement room; the answer-lost handling below covers the rest.
+ */
+const SERA_SWAP_SUBMIT_TIMEOUT_MS = 25_000;
+
+/**
+ * Error codes that prove a request never reached Sera: no connection (or TLS
+ * session) was ever established, so nothing could have been accepted.
+ */
+const SERA_NEVER_CONNECTED_CODES = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "UND_ERR_CONNECT_TIMEOUT"]);
+
+/**
+ * True when Sera never answered the call, so its outcome is unknown: an abort
+ * on our own timeout, ECONNRESET, ETIMEDOUT mid-read, undici's socket, headers
+ * and body timeouts, a 2xx whose body could not be read. A SeraApiError is the
+ * opposite case — Sera answered, and the answer was no — and so is a failure
+ * to connect at all. Node's fetch wraps the socket error in a
+ * TypeError("fetch failed") whose cause carries the code, hence the walk.
+ */
+function isSeraAnswerMissing(error: unknown): boolean {
+  if (error instanceof SeraApiError) return false;
+  for (let current: any = error, depth = 0; current && typeof current === "object" && depth < 5; current = current.cause, depth += 1) {
+    const code = typeof current.code === "string" ? current.code.toUpperCase() : "";
+    if (SERA_NEVER_CONNECTED_CODES.has(code) || /^ERR_TLS_|CERT|SSL/.test(code)) return false;
+  }
+  return true;
+}
+
 /** POST /api/payment/swap/submit - submit signed Sera swap intent */
 paymentRouter.post("/payment/swap/submit", async (req, res) => {
   let txForFailure: Transaction | undefined;
+  // Where the order stands with Sera when an error reaches the catch below.
+  // "unknown" from the instant POST /swap leaves this process until Sera
+  // answers; "accepted" once it has, even if our own bookkeeping then throws.
+  // Only "unsent", "rejected" and a proven non-delivery may fail the row —
+  // anything else means the order may well be settling.
+  let seraOutcome: "unsent" | "unknown" | "rejected" | "accepted" = "unsent";
+  let seraTradeId: string | null = null;
+  let submittedBlockNumber: string | null = null;
   try {
     const txId = String(req.body.txId ?? "").trim();
     const quoteUuid = String(req.body.quoteUuid ?? req.body.uuid ?? "").trim();
@@ -1982,9 +2105,10 @@ paymentRouter.post("/payment/swap/submit", async (req, res) => {
     notifySseClients(txId, { status: "confirming" });
 
     const baseUrl = getSeraApiBaseUrlForChain(tx.chainId);
-    const submittedBlockNumber = await CHAIN_CLIENTS[tx.chainId]?.getBlockNumber()
+    submittedBlockNumber = await CHAIN_CLIENTS[tx.chainId]?.getBlockNumber()
       .then((blockNumber: bigint) => blockNumber.toString())
-      .catch(() => null);
+      .catch(() => null) ?? null;
+    seraOutcome = "unknown";
     const result = await callSeraApi<Record<string, unknown>>({
       baseUrl,
       path: "/swap",
@@ -1992,11 +2116,14 @@ paymentRouter.post("/payment/swap/submit", async (req, res) => {
       body,
       authMode: "eip712",
       merchantId: tx.merchantId,
+      timeoutMs: SERA_SWAP_SUBMIT_TIMEOUT_MS,
     });
 
     const tradeId = typeof result.trade_id === "string" ? result.trade_id : null;
     const seraStatus = typeof result.status === "string" ? result.status.toLowerCase() : "pending";
     const success = result.success === true && Boolean(tradeId);
+    seraOutcome = success ? "accepted" : "rejected";
+    seraTradeId = tradeId;
     const txHash = extractTransactionHash(result);
     let existingNotes: Record<string, unknown> = {};
     try {
@@ -2012,10 +2139,18 @@ paymentRouter.post("/payment/swap/submit", async (req, res) => {
     });
 
     if (!success) {
-      await updateTransaction(txId, { status: "failed", notes });
-      const orderId = orderIdFromTransactionNotes(tx.notes);
-      if (orderId) await updateMenuOrderPayment(orderId, tx.merchantId, { status: "failed", paymentId: txId, transactionId: txId }).catch(() => undefined);
-      notifySseClients(txId, { status: "failed" });
+      // Sera answered and declined (or returned no trade id). Route it through
+      // failTransactionRecord like every other terminal failure so the
+      // merchant SSE fires and the payment intent, not only the menu order,
+      // leaves "open" — this branch used to tell the payer alone.
+      // Sera's own words when it gives any, and nothing of ours when it does
+      // not: an empty reason leaves failureReason unset, so the checkout falls
+      // back to its existing approved "Payment verification failed" line.
+      const reason = [result.error, result.message, result.error_code]
+        .find((value): value is string => typeof value === "string" && value.trim().length > 0)
+        ?? "";
+      await updateTransaction(txId, { notes });
+      await failTransactionRecord({ ...tx, notes }, reason);
       res.status(502).json({ success: false, status: "failed", sera: result });
       return;
     }
@@ -2101,8 +2236,45 @@ paymentRouter.post("/payment/swap/submit", async (req, res) => {
 
     res.json({ success: true, status: "confirmed", txHash, sera: result });
   } catch (e: any) {
-    const response = seraPaymentErrorResponse(e, "Unable to submit Sera swap");
     logSeraOperationFailure("payment/swap/submit", e);
+    if (txForFailure && (seraOutcome === "accepted" || (seraOutcome === "unknown" && isSeraAnswerMissing(e)))) {
+      // Either Sera accepted the order and our own bookkeeping threw, or the
+      // order left this process and Sera never answered — an abort after the
+      // budget above, a reset socket, a dropped response. In both cases Sera
+      // may be settling it and the payer has already signed away funds, so
+      // this must not become "failed": the row stays "confirming" under
+      // notes.type "sera_swap" and reconciliation decides. With no trade id
+      // to look up, reconcileSeraSwapTransaction falls back to the on-chain
+      // IntentMatched scan keyed by the intentHash the quote already stored.
+      // The checkout treats a non-2xx here as final and offers a retry, and a
+      // second signed intent could pay the merchant twice if the first lands,
+      // so the answer is the state the row is actually in.
+      const current = await getTransactionById(txForFailure.id).catch(() => null);
+      if (current && current.status !== "pending" && current.status !== "confirming") {
+        // The success path (or a concurrent reconcile) already settled it.
+        res.json({ success: current.status === "confirmed", status: current.status, txHash: current.txHash ?? null });
+        return;
+      }
+      let existingNotes: Record<string, unknown> = {};
+      try {
+        const raw = (current ?? txForFailure).notes;
+        existingNotes = raw ? JSON.parse(raw) as Record<string, unknown> : {};
+      } catch {}
+      const tradeId = seraTradeId ?? (typeof existingNotes.tradeId === "string" ? existingNotes.tradeId : null);
+      const notes = JSON.stringify({
+        ...existingNotes,
+        type: "sera_swap",
+        tradeId,
+        submittedBlockNumber: existingNotes.submittedBlockNumber ?? submittedBlockNumber,
+        seraSubmitError: e instanceof Error ? e.message : "Sera did not answer the swap submission",
+      });
+      await updateTransaction(txForFailure.id, { status: "confirming", notes }).catch((updateError) => {
+        logSeraOperationFailure("payment/swap/status-update", updateError);
+      });
+      res.json({ success: true, status: "confirming", tradeId, txHash: current?.txHash ?? null });
+      return;
+    }
+    const response = seraPaymentErrorResponse(e, "Unable to submit Sera swap");
     if (txForFailure) {
       await failTransactionRecord(txForFailure, response.body.error).catch((failError) => {
         logSeraOperationFailure("payment/swap/status-update", failError);
@@ -2206,6 +2378,21 @@ function withDirectScanTimeout<T>(promise: Promise<T>, timeoutMs = 8000): Promis
   });
 }
 
+/**
+ * eth_getLogs span per request when DIRECT_SYNC_LOOKBACK_BLOCKS has no entry
+ * for the chain: public providers commonly cap the inclusive window at 50.
+ */
+const DIRECT_SCAN_CHUNK_BLOCKS = 49n;
+/**
+ * Chunks one poll may walk before handing its cursor back. Six 50-block
+ * chunks is about five minutes of mainnet — enough for a QR screen whose tab
+ * was suspended for a while to catch up within a poll or two, small enough
+ * that no single poll monopolises the RPC providers the checkout path shares.
+ */
+const DIRECT_SCAN_MAX_CHUNKS = 6;
+/** Wall-clock budget for one poll's log scan, across all of its chunks. */
+const DIRECT_SCAN_TIME_BUDGET_MS = 8000;
+
 paymentRouter.post("/payment/direct/scan", async (req, res) => {
   try {
     const toAddress = String(req.body.toAddress ?? "").trim().toLowerCase();
@@ -2222,12 +2409,62 @@ paymentRouter.post("/payment/direct/scan", async (req, res) => {
     if (!/^\d+(\.\d{1,6})?$/.test(amount) || Number(amount) <= 0) { res.status(400).json({ error: "Invalid amount" }); return; }
     const client = CHAIN_CLIENTS[chainId];
     if (!client) { res.status(400).json({ error: "Unsupported chain" }); return; }
+    let token: SeraToken;
     try {
-      await resolveSeraTokenForChain(chainId, coin);
+      token = await resolveSeraTokenForChain(chainId, coin);
     } catch (error) {
       res.status(400).json({ error: error instanceof Error ? error.message : "Unsupported coin on this network" });
       return;
     }
+    const storedPaymentUrl = storedDirectQrPaymentUrl(paymentUrl);
+
+    // The QR's server-side watch row (see resolveDirectQrWatch): armed by the
+    // first poll — before the RPC is asked anything, so a slow provider cannot
+    // leave the QR unwatched — and afterwards only looked up, lazily, when a
+    // transfer already on file needs the anchor for the ownership test below.
+    // A receiver no merchant owns has nowhere to hang a row, and
+    // recordDirectTransferPayment refuses such transfers anyway. A failure
+    // here must not cost the poll its scan.
+    let watch: Transaction | null = null;
+    let watchResolved = false;
+    const resolveWatch = async (create: boolean) => {
+      if (watchResolved) return watch;
+      watchResolved = true;
+      try {
+        const resolved = await resolveMerchantForReceiver(toAddress);
+        if (!resolved) return null;
+        const decimals = token.decimals ?? await getTokenDecimals(client, token.address as `0x${string}`);
+        watch = await resolveDirectQrWatch({
+          merchant: resolved.merchant,
+          receiveAddress: resolved.receiveAddress,
+          coin,
+          amount,
+          chainId,
+          paymentUrl: storedPaymentUrl,
+          decimals,
+          create,
+        });
+      } catch (error) {
+        logSeraOperationFailure("payment/direct/watch", error);
+      }
+      return watch;
+    };
+    if (requestedFromBlock === null) await resolveWatch(true);
+
+    // A log whose hash is already on file was recorded by an earlier poll, by
+    // the sweep, or for a previous customer — and only the last must not
+    // count. The first poll's look-back window (or a cursor pulled back to a
+    // lagging node's head) re-surfaces the transfer that paid the QR shown a
+    // minute ago, quite possibly an identically priced one with the identical
+    // link; answering "confirmed" to it marked this QR paid while its real
+    // payment was never looked for. directTransferBelongsToQr decides; the
+    // watch row supplies the moment this QR began.
+    const transferBelongsToThisQr = async (txHash: `0x${string}`) => {
+      const existing = await getTransactionByHash(txHash.toLowerCase()) || await getTransactionByHash(txHash);
+      if (!existing) return true;
+      const anchor = await resolveWatch(false);
+      return directTransferBelongsToQr(existing, storedPaymentUrl, anchor?.createdAt ?? null);
+    };
 
     let latestBlock: bigint;
     try {
@@ -2236,43 +2473,85 @@ paymentRouter.post("/payment/direct/scan", async (req, res) => {
       res.json({ status: "pending", fromBlock: requestedFromBlock?.toString() ?? null, warning: "Scanner RPC is temporarily slow" });
       return;
     }
-    const minimumFromBlock = latestBlock > 49n ? latestBlock - 49n : 0n;
-    const requestedStart = requestedFromBlock ?? (latestBlock > 3n ? latestBlock - 3n : 0n);
-    // Clamp every request to the provider-safe 50-block inclusive window.
-    const fromBlock = requestedStart < minimumFromBlock
-      ? minimumFromBlock
-      : requestedStart > latestBlock
-        ? latestBlock
-        : requestedStart;
-    let match: Awaited<ReturnType<typeof findDirectTransfer>> | null = null;
-    try {
-      match = await withDirectScanTimeout(findDirectTransfer({ toAddress, coin, amount, chainId, fromBlock, toBlock: latestBlock }), 8000);
-    } catch {
-      res.json({ status: "pending", fromBlock: fromBlock.toString(), latestBlock: latestBlock.toString(), warning: "Scanner RPC is temporarily slow" });
-      return;
-    }
-    if (!match?.txHash) {
-      res.json({ status: "pending", fromBlock: (latestBlock + 1n).toString(), latestBlock: latestBlock.toString() });
-      return;
+
+    // The first poll for a QR looks back a few blocks so a wallet quicker than
+    // the screen is not missed; each later poll resumes at the cursor the
+    // previous answer handed back. That cursor used to be clamped forward to
+    // latest-49: a phone that had suspended the tab for a couple of minutes
+    // came back to find the blocks in between skipped without a word, and
+    // with them the payment. The poll now walks forward from the cursor in
+    // provider-safe chunks, a bounded number per call, and answers with
+    // wherever it got to, so a paused poller catches up over a few polls
+    // instead of losing the gap. A cursor past the head (a fallback node
+    // lagging the one that answered last time) is pulled back to latest+1:
+    // rescanning a block is harmless, skipping one is not.
+    const chunkSpan = DIRECT_SYNC_LOOKBACK_BLOCKS[chainId] ?? DIRECT_SCAN_CHUNK_BLOCKS;
+    let cursor = requestedFromBlock ?? (latestBlock > 3n ? latestBlock - 3n : 0n);
+    if (cursor > latestBlock + 1n) cursor = latestBlock + 1n;
+    const deadline = Date.now() + DIRECT_SCAN_TIME_BUDGET_MS;
+    let mismatch: DirectTransferCandidate | null = null;
+    for (let chunk = 0; chunk < DIRECT_SCAN_MAX_CHUNKS && cursor <= latestBlock; chunk += 1) {
+      const toBlock = cursor + chunkSpan < latestBlock ? cursor + chunkSpan : latestBlock;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      let found: Awaited<ReturnType<typeof findDirectTransfer>>;
+      try {
+        found = await withDirectScanTimeout(findDirectTransfer({ toAddress, coin, amount, chainId, fromBlock: cursor, toBlock }), remaining);
+      } catch {
+        res.json({ status: "pending", fromBlock: cursor.toString(), latestBlock: latestBlock.toString(), warning: "Scanner RPC is temporarily slow" });
+        return;
+      }
+      for (const candidate of found?.candidates ?? []) {
+        if (!await transferBelongsToThisQr(candidate.txHash)) continue;
+        // Record what actually moved, as the sweep does. The watch row still
+        // matches within ±1 base unit and keeps its own payAmount when it is
+        // the row confirmed.
+        const recorded = await recordDirectTransferPayment({
+          txHash: candidate.txHash,
+          fromAddress: candidate.fromAddress,
+          toAddress,
+          coin,
+          amount: candidate.actualAmount,
+          chainId,
+          paymentUrl: storedPaymentUrl,
+          verified: true,
+        });
+        res.json({
+          status: "confirmed",
+          fromBlock: cursor.toString(),
+          latestBlock: latestBlock.toString(),
+          txHash: recorded.transaction.txHash,
+          transaction: transactionToJson(recorded.transaction),
+          created: recorded.created,
+        });
+        return;
+      }
+      // An exact match anywhere in the walk beats a wrong-amount transfer, so
+      // the first mismatch that is ours is kept and reported only at the end.
+      for (const candidate of found?.mismatches ?? []) {
+        if (mismatch) break;
+        if (await transferBelongsToThisQr(candidate.txHash)) mismatch = candidate;
+      }
+      cursor = toBlock + 1n;
     }
 
-    if ("amountMismatch" in match && match.amountMismatch) {
-      const actualAmount = match.actualAmount || "0";
+    if (mismatch) {
+      const actualAmount = mismatch.actualAmount || "0";
       const recorded = await recordDirectTransferFailure({
-        txHash: match.txHash,
-        fromAddress: match.fromAddress,
+        txHash: mismatch.txHash,
+        fromAddress: mismatch.fromAddress,
         toAddress,
         coin,
         expectedAmount: amount,
         actualAmount,
         chainId,
-        paymentUrl,
+        paymentUrl: storedPaymentUrl,
         reason: `Expected ${amount} ${coin}, received ${actualAmount} ${coin}.`,
       });
       res.json({
         status: "amount_mismatch",
-        fromBlock: (latestBlock + 1n).toString(),
-        latestBlock: (match.latestBlock ?? latestBlock).toString(),
+        fromBlock: cursor.toString(),
+        latestBlock: latestBlock.toString(),
         expectedAmount: amount,
         actualAmount,
         coin,
@@ -2283,23 +2562,7 @@ paymentRouter.post("/payment/direct/scan", async (req, res) => {
       return;
     }
 
-    const recorded = await recordDirectTransferPayment({
-      txHash: match.txHash,
-      fromAddress: match.fromAddress,
-      toAddress,
-      coin,
-      amount,
-      chainId,
-      paymentUrl,
-      verified: true,
-    });
-    res.json({
-      status: "confirmed",
-      fromBlock: fromBlock.toString(),
-      latestBlock: (match.latestBlock ?? latestBlock).toString(),
-      transaction: transactionToJson(recorded.transaction),
-      created: recorded.created,
-    });
+    res.json({ status: "pending", fromBlock: cursor.toString(), latestBlock: latestBlock.toString() });
   } catch (e: any) {
     logSeraOperationFailure("payment/direct/scan", e);
     res.status(500).json({ error: "Unable to scan direct payment" });
@@ -2567,6 +2830,204 @@ function rawAmountsNearlyEqual(a: bigint, b: bigint) {
   return diff <= 1n;
 }
 
+/**
+ * Postgres hands a numeric(36,18) column back as "2000.000000000000000000",
+ * and toRawTokenAmount refuses a fraction longer than the token's decimals —
+ * so no stored amount ever converted and the pending-row match below silently
+ * never fired against a real database. Trailing zeros carry no value; drop
+ * them before converting what the database stored. Integers are left alone:
+ * "2000" must not become "2".
+ */
+function rawAmountFromStored(amount: unknown, decimals: number): bigint {
+  const text = String(amount ?? "").trim();
+  const trimmed = text.includes(".") ? text.replace(/0+$/, "").replace(/\.$/, "") : text;
+  return BigInt(toRawTokenAmount(trimmed, decimals));
+}
+
+/** Column cap for the payment URL kept in a direct-QR row's notes. */
+const DIRECT_QR_PAYMENT_URL_MAX = 1200;
+
+/** The payment URL in the form the notes column keeps it, or null when absent. */
+function storedDirectQrPaymentUrl(paymentUrl: string | null | undefined): string | null {
+  return typeof paymentUrl === "string" && paymentUrl ? paymentUrl.slice(0, DIRECT_QR_PAYMENT_URL_MAX) : null;
+}
+
+/**
+ * Lenient view of a direct-QR row's notes: rows predate `watch`, the sweep's
+ * rows carry no URL, and a merchant may have overwritten notes with free text.
+ */
+function directQrNotes(tx: Pick<Transaction, "notes">): { type: string | null; paymentUrl: string | null; watch: boolean } {
+  if (!tx.notes) return { type: null, paymentUrl: null, watch: false };
+  try {
+    const parsed = JSON.parse(tx.notes) as { type?: unknown; paymentUrl?: unknown; watch?: unknown };
+    return {
+      type: typeof parsed.type === "string" ? parsed.type : null,
+      paymentUrl: typeof parsed.paymentUrl === "string" && parsed.paymentUrl ? parsed.paymentUrl : null,
+      watch: parsed.watch === true,
+    };
+  } catch {
+    return { type: null, paymentUrl: null, watch: false };
+  }
+}
+
+/** A row the scan route created purely so the sweep watches a Scan & Pay QR. */
+export function isDirectQrWatchTransaction(tx: Pick<Transaction, "notes">): boolean {
+  const notes = directQrNotes(tx);
+  return notes.type === "direct_wallet_qr" && notes.watch;
+}
+
+/**
+ * A watch row no transfer has confirmed. It is bookkeeping for the sweep, not
+ * a payment anyone began, so the dashboard's list and counts leave it out;
+ * the moment a transfer confirms it, it carries that hash and shows like any
+ * other payment.
+ */
+export function isUnpaidDirectQrWatch(tx: Pick<Transaction, "notes" | "txHash">): boolean {
+  return !tx.txHash && isDirectQrWatchTransaction(tx);
+}
+
+/** Still pending, unverified and hashless — the shape getPendingTransactions sweeps. */
+export function isLiveDirectQrWatch(tx: Pick<Transaction, "notes" | "txHash" | "status" | "verified">): boolean {
+  return tx.status === "pending" && Number(tx.verified) === 0 && !tx.txHash && isDirectQrWatchTransaction(tx);
+}
+
+/**
+ * Whether a transfer already on file may be reported as the payment of the QR
+ * at `paymentUrl`, which began at `watchStartedAt` when its watch row is known.
+ *
+ * The row is ours when it names this link, or names no link at all — the
+ * sweep records transfers it could not match to a pending row without one,
+ * and a re-poll after the sweep got there first must still hear "confirmed".
+ * Neither test tells two identically priced QRs apart, though: a link carries
+ * no nonce unless an expiry is set, so the QR shown to the previous customer
+ * had the very same URL. Time does tell them apart — a row that already
+ * existed when this QR's watch began cannot be its payment.
+ */
+export function directTransferBelongsToQr(
+  tx: Pick<Transaction, "notes" | "createdAt">,
+  paymentUrl: string | null | undefined,
+  watchStartedAt: Date | string | null | undefined,
+): boolean {
+  if (watchStartedAt) {
+    const startedAt = new Date(watchStartedAt).getTime();
+    const recordedAt = new Date(tx.createdAt).getTime();
+    if (Number.isFinite(startedAt) && Number.isFinite(recordedAt) && recordedAt < startedAt) return false;
+  }
+  const recordedUrl = directQrNotes(tx).paymentUrl;
+  if (!recordedUrl) return true;
+  return recordedUrl === storedDirectQrPaymentUrl(paymentUrl);
+}
+
+/**
+ * Newest watch row for a QR among `rows` (newest first, as
+ * getMerchantTransactions returns them), whatever its status. The key is what
+ * the QR fixes: receiver, pay coin, pay amount, chain and link.
+ */
+export function findDirectQrWatchRow(rows: Transaction[], key: {
+  receiveAddress: string;
+  coin: string;
+  amount: string;
+  chainId: number;
+  decimals: number;
+  paymentUrl: string | null;
+}): Transaction | null {
+  const expectedRaw = BigInt(toRawTokenAmount(key.amount, key.decimals));
+  const storedUrl = storedDirectQrPaymentUrl(key.paymentUrl);
+  return rows.find((tx) => {
+    if (!isDirectQrWatchTransaction(tx)) return false;
+    if (String(tx.toAddress || "").toLowerCase() !== key.receiveAddress.toLowerCase()) return false;
+    if (String(tx.coin || "").toUpperCase() !== key.coin.toUpperCase()) return false;
+    if (Number(tx.chainId ?? SERA_MAINNET_CHAIN_ID) !== key.chainId) return false;
+    if (directQrNotes(tx).paymentUrl !== storedUrl) return false;
+    try {
+      return rawAmountFromStored(tx.amount, key.decimals) === expectedRaw;
+    } catch {
+      return false;
+    }
+  }) ?? null;
+}
+
+/**
+ * Server-side watch for a Scan & Pay QR.
+ *
+ * A wallet-URI QR never touches the checkout page, so until now nothing on
+ * the server knew it existed: the only thing looking for its payment was the
+ * 5-second poll from the merchant's own QR screen. The moment the merchant
+ * tapped Back, opened the dashboard, or the phone suspended the tab, a
+ * transfer landing afterwards was never recorded, never toasted, never
+ * webhooked. The sweep (sweepPendingMerchantDirectActivity) already finds
+ * direct transfers for every merchant holding a pending unverified row — so
+ * the first poll for a QR leaves exactly such a row behind: a pending
+ * `direct_wallet_qr` transaction flagged `watch: true`, keyed by receiver,
+ * coin, amount, chain and link. The sweep then confirms it through the
+ * ordinary pending-match path, notifying the merchant as for any payment,
+ * with no browser open at all.
+ *
+ * Returns the newest watch row for the key whatever its status: it also
+ * anchors the scan route's "is this transfer ours?" test, because a QR of the
+ * same price minted a minute ago carries the very same link. A new row is
+ * inserted only when `create` is set and no live (pending, unverified,
+ * hashless) row exists, so a poll retrying its first request, or a re-minted
+ * identical QR whose customer has not paid yet, reuses the row rather than
+ * stacking phantoms.
+ */
+async function resolveDirectQrWatch({
+  merchant,
+  receiveAddress,
+  coin,
+  amount,
+  chainId,
+  paymentUrl,
+  decimals,
+  create,
+}: {
+  merchant: Merchant;
+  receiveAddress: string;
+  coin: string;
+  amount: string;
+  chainId: number;
+  paymentUrl: string | null;
+  decimals: number;
+  create: boolean;
+}): Promise<Transaction | null> {
+  const recent = await getMerchantTransactions(merchant.id, 100);
+  const latest = findDirectQrWatchRow(recent, { receiveAddress, coin, amount, chainId, decimals, paymentUrl });
+  if (!create || (latest && isLiveDirectQrWatch(latest))) return latest;
+
+  const id = uuidv4();
+  await createTransaction({
+    id,
+    merchantId: merchant.id,
+    toAddress: receiveAddress,
+    coin,
+    amount,
+    chainId,
+    status: "pending",
+    verified: 0,
+    payCoin: coin,
+    payAmount: amount,
+    notes: JSON.stringify({ type: "direct_wallet_qr", paymentUrl: storedDirectQrPaymentUrl(paymentUrl), watch: true }),
+  });
+  return await getTransactionById(id) ?? null;
+}
+
+/**
+ * Expires a stale watch row quietly. A watch row stands for a QR nobody paid,
+ * not for a customer who walked away mid-payment, so unlike
+ * cancelTransactionRecord this raises no merchant event and touches no order
+ * or intent — a watch row has neither.
+ */
+async function expireDirectQrWatch(tx: Transaction) {
+  if (tx.status !== "pending") return false;
+  const reason = "QR watch expired after 5 minutes without payment.";
+  await updateTransaction(tx.id, {
+    status: "canceled",
+    memo: tx.memo || reason.slice(0, 200),
+    notes: notesWithCancellationReason(tx.notes, reason),
+  });
+  return true;
+}
+
 async function findMatchingPendingTransaction({
   merchantId,
   toAddress,
@@ -2574,6 +3035,7 @@ async function findMatchingPendingTransaction({
   chainId,
   rawAmount,
   decimals,
+  paymentUrl,
 }: {
   merchantId: string;
   toAddress: string;
@@ -2581,20 +3043,31 @@ async function findMatchingPendingTransaction({
   chainId: number;
   rawAmount: bigint;
   decimals: number;
+  paymentUrl?: string | null;
 }) {
   const recent = await getMerchantTransactions(merchantId, 100);
-  return recent.find((tx) => {
+  const candidates = recent.filter((tx) => {
     if (tx.txHash) return false;
     if (tx.status !== "pending" && tx.status !== "confirming") return false;
     if (String(tx.toAddress || "").toLowerCase() !== toAddress.toLowerCase()) return false;
     if (String(tx.coin || "").toUpperCase() !== coin.toUpperCase()) return false;
     if (Number(tx.chainId ?? SERA_MAINNET_CHAIN_ID) !== chainId) return false;
     try {
-      return rawAmountsNearlyEqual(BigInt(toRawTokenAmount(String(tx.amount), decimals)), rawAmount);
+      return rawAmountsNearlyEqual(rawAmountFromStored(tx.amount, decimals), rawAmount);
     } catch {
       return false;
     }
   });
+  // Several pending rows can await the same amount at the same address: the
+  // QR's own watch row and, a few minutes back, an identical QR's. When the
+  // caller knows which link it is scanning for, that link's row is the one to
+  // confirm; the sweep knows no link and takes the newest, as before.
+  const storedUrl = storedDirectQrPaymentUrl(paymentUrl);
+  if (storedUrl) {
+    const own = candidates.find((tx) => directQrNotes(tx).paymentUrl === storedUrl);
+    if (own) return own;
+  }
+  return candidates[0];
 }
 
 async function notifyRecordedDirectTransfer({
@@ -2890,6 +3363,7 @@ async function recordDirectTransferPayment({
       chainId,
       rawAmount,
       decimals,
+      paymentUrl,
     });
     if (pending) {
       const transaction = await confirmPendingDirectTransfer({
@@ -3048,6 +3522,13 @@ async function recordDirectTransferFailure({
   return { transaction: transaction!, created: true };
 }
 
+type DirectTransferCandidate = {
+  txHash: `0x${string}`;
+  fromAddress: string | null;
+  /** What actually moved on-chain, in token units. */
+  actualAmount: string;
+};
+
 async function findDirectTransfer({
   toAddress,
   coin,
@@ -3078,38 +3559,27 @@ async function findDirectTransfer({
     toBlock,
   });
 
-  let mismatch: {
-    txHash: `0x${string}`;
-    fromAddress: string | null;
-    latestBlock: bigint;
-    amountMismatch: true;
-    actualAmount: string;
-  } | null = null;
-
+  // Every transfer in the window, in log order, split into the ones within
+  // ±1 base unit of the QR amount and the rest. This used to stop at the
+  // first exact match — but the scan route now skips a hash already on file
+  // for a previous customer, so it needs the ones behind it too.
+  const candidates: DirectTransferCandidate[] = [];
+  const mismatches: DirectTransferCandidate[] = [];
   for (const log of logs) {
     const args = (log as any).args || {};
     const actualRaw = BigInt(String(args.value ?? 0));
     const txHash = String(log.transactionHash || "");
     if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) continue;
-    const diff = actualRaw > expectedRaw ? actualRaw - expectedRaw : expectedRaw - actualRaw;
-    if (diff > 1n) {
-      mismatch ??= {
-        txHash: txHash as `0x${string}`,
-        fromAddress: typeof args.from === "string" ? args.from.toLowerCase() : null,
-        latestBlock: toBlock,
-        amountMismatch: true,
-        actualAmount: fromRawTokenAmount(actualRaw, decimals),
-      };
-      continue;
-    }
-    return {
+    const entry: DirectTransferCandidate = {
       txHash: txHash as `0x${string}`,
       fromAddress: typeof args.from === "string" ? args.from.toLowerCase() : null,
-      latestBlock: toBlock,
+      actualAmount: fromRawTokenAmount(actualRaw, decimals),
     };
+    const diff = actualRaw > expectedRaw ? actualRaw - expectedRaw : expectedRaw - actualRaw;
+    (diff > 1n ? mismatches : candidates).push(entry);
   }
 
-  return mismatch ?? { txHash: null, fromAddress: null, latestBlock: toBlock };
+  return { candidates, mismatches };
 }
 
 /**
@@ -3329,11 +3799,14 @@ async function sendWebhook(
   payload: object,
   logCtx?: { merchantId: string; txId: string; txHash?: string | null }
 ) {
-  // SSRF protection: block private IPs
-  const urlObj = new URL(url);
-  if (!/^https:$/.test(urlObj.protocol)) return;
-  const privatePatterns = [/^localhost$/i, /^127\./, /^10\./, /^172\.(1[6-9]|2\d|3[01])\./, /^192\.168\./];
-  if (privatePatterns.some(p => p.test(urlObj.hostname))) return;
+  // SSRF: resolve the host and refuse any private/internal address before the
+  // outbound POST. A stored webhook URL is fetched unattended, so this is the
+  // last line of defence if a merchant configured an internal target.
+  try {
+    await assertPublicHttpUrl(url);
+  } catch {
+    return; // silently skip delivery to a non-public address
+  }
   const body = JSON.stringify(payload);
   const sig = secret ? "sha256=" + crypto.createHmac("sha256", secret).update(body).digest("hex") : undefined;
   const headers: Record<string, string> = { "Content-Type": "application/json", "User-Agent": "SeraPay-Webhook/1.0" };
@@ -3343,7 +3816,13 @@ async function sendWebhook(
   let errorMsg: string | undefined;
   let success = false;
   try {
-    const resp = await fetch(url, { method: "POST", headers, body, signal: AbortSignal.timeout(10000) });
+    // See the note on the test endpoint: without redirect:"manual" the SSRF
+    // guard is decorative, because fetch would follow a 3xx to an address the
+    // guard never saw.
+    const resp = await fetch(url, { method: "POST", headers, body, redirect: "manual", signal: AbortSignal.timeout(10000) });
+    if (resp.status >= 300 && resp.status < 400) {
+      throw new Error("Webhook endpoint redirected; redirects are not allowed");
+    }
     statusCode = resp.status;
     success = resp.ok;
     try { responseBody = (await resp.text()).slice(0, 2000); } catch {}
@@ -3469,7 +3948,7 @@ type SeraFxRateResponse = {
   change_pct: string | null;
 };
 
-async function fetchSeraRate(from: string, to: string): Promise<number> {
+export async function fetchSeraRate(from: string, to: string): Promise<number> {
   if (from === to) return 1;
 
   // Bridge coins that have no direct Sera markets to their equivalents
