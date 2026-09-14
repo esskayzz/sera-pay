@@ -1,7 +1,7 @@
 lockfileVersion: '9.0'
 
 settings:
-  autoInstallPeers: false
+  autoInstallPeers: true
   excludeLinksFromLockfile: false
 
 catalogs:
@@ -361,6 +361,9 @@ importers:
       '@tanstack/react-query':
         specifier: 'catalog:'
         version: 5.97.0(react@19.2.1)
+      react:
+        specifier: '>=18'
+        version: 19.2.1
 
   lib/api-spec:
     devDependencies:
