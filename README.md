@@ -72,35 +72,27 @@ Each merchant stores one current logo reference in the merchant profile. QR styl
 
 ## Generate a payment QR through the API
 
-Call `POST /api/payment/qr` from your backend using the owner's SeraPay API key
-(available in the dashboard's developer tools). Do not expose this key in a
-customer-facing application.
+Call `POST /api/payment/qr` from your backend with the owner's dashboard API key.
+Keep this key out of customer-facing applications.
 
 ```bash
-curl -X POST https://pay.sera.cx/api/payment/qr \
+curl https://pay.sera.cx/api/payment/qr \
   -H "X-Api-Key: $SERAPAY_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{
-    "baseAmount": "100",
-    "baseCurrency": "USDC",
-    "targetCurrency": "XSGD",
-    "singleUse": true
-  }'
+  -d '{"baseAmount":"100","baseCurrency":"USDC","targetCurrency":"XSGD","singleUse":true}'
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `baseAmount` | Required positive **decimal string** the owner must receive. Up to six decimal places, further limited by the base token's decimals. Maximum `9007199254.740991`, matching checkout's exact micro-unit limit. |
-| `baseCurrency` | Required receiving stablecoin symbol, such as `USDC`. |
-| `targetCurrency` | Required customer payment stablecoin symbol, such as `XSGD`. Symbols are case-insensitive and must exist in the active Sera token registry; fiat codes such as `USD` are not substitutes for token symbols. |
-| `singleUse` | Optional boolean, default `false`. Set `true` to save a single-use payment intent; `false` creates a reusable link. Neither has an expiry. |
+| `baseAmount` | Positive decimal **string** the merchant must receive; up to six decimal places, limited by token precision, and at most `9007199254.740991`. |
+| `baseCurrency` | Merchant's receiving token, e.g. `USDC`. |
+| `targetCurrency` | Customer's payment token, e.g. `XSGD`. Symbols are case-insensitive and must exist in Sera's token registry; fiat codes such as `USD` are not substitutes. |
+| `singleUse` | Optional boolean, default `false`. Single-use and reusable links have no expiry. |
 
-In this example, the requested owner receipt is **100 USDC**, and the customer
-pays the equivalent in **XSGD**. The endpoint uses the owner's saved receiving
-wallet (or account wallet when none is saved) and saved network mode. Live is
-the default; Sepolia requires both a saved test mode and server-side
-`SERA_ENABLE_TESTNET=true`. Callers cannot override the owner, wallet, network,
-or branding through the request body. Unknown fields are rejected.
+The example requests **100 USDC** for the merchant, paid in **XSGD**. Wallet,
+network, and branding come from the owner's saved settings; unknown input fields
+are rejected. The account wallet is used when no receiving wallet is saved.
+Live mode is the default; Sepolia requires saved test mode and `SERA_ENABLE_TESTNET=true`.
 
 Successful responses use HTTP **201** and `Cache-Control: no-store`:
 
@@ -121,61 +113,32 @@ Successful responses use HTTP **201** and `Cache-Control: no-store`:
 }
 ```
 
-`targetAmount` above is illustrative, not a live rate. Cross-currency generation
-uses the existing Sera fixed-output liquidity preflight and reports an indicative
-customer amount, rounded up to the supported token/payment precision. It does
-not lock a rate, reserve liquidity, or submit a payment. Checkout obtains a fresh
-quote to cover the owner's requested base amount. The target token is preselected
-in checkout, matching the dashboard QR flow; the customer can choose another
-supported payment token. Equal base/target symbols create a direct payment and
-do not require exchange liquidity.
+`targetAmount` is illustrative. Conversions check executable liquidity and round
+the indicative customer amount up to supported precision. They do not lock a rate,
+reserve liquidity, or submit payment. Checkout obtains a fresh quote and allows
+another supported payment token; same-token payments need no conversion quote.
 
-The PNG is the **full payment card from the web interface's Download button**,
-including the customer amount/currency, merchant details, and styled QR. It reuses
-the same card renderer and the owner's saved logo, colors, QR style, and
-standard/advanced QR mode. Rendering or logo-loading failures return an error
-instead of an unbranded replacement.
+`qrCodeDataUrl` is the full payment card, using the webpage's shared drawing
+functions and saved logo, colors, style, and standard/advanced mode. Node renders
+it natively using pnpm-installed canvas/fonts; the Alpine Dockerfile is unchanged.
+Branding failures return an error. `qrValue` encodes a direct EIP-681 wallet URI
+for reusable same-token payments, or the signed `checkoutUrl` for conversion and
+single-use payments. `checkoutUrl` is always returned; direct scans use existing
+on-chain reconciliation instead of checkout recording.
 
-`qrValue` is the exact content encoded in the card:
+Single-use intents are created only after quoting and rendering succeed, appear
+in `GET /api/payments` and `GET /api/payments/:id`, and use checkout's reservation
+and paid-state checks. Reusable responses have `paymentIntentId: null`.
+Each request creates a new link; retries are **not idempotent**.
 
-- **Reusable, same-currency:** the web interface's direct EIP-681 wallet URI,
-  prefilled with the receiving wallet, token, network, and amount.
-- **Cross-currency or single-use:** the signed `checkoutUrl`. Single-use codes
-  must pass through checkout to enforce payment reservation; a raw wallet transfer
-  cannot enforce single use.
+Errors include `error` and, for generation failures, `errorCode`: **400** invalid
+input/token/precision/minimum amount; **401** invalid key; **403** blocked recipient;
+**409** unavailable liquidity; **422** branding failure; **429** rate limited
+(20 requests/minute/IP); **5xx** service or persistence failure.
 
-`checkoutUrl` is always returned as a separate shareable link, including when
-the card uses a direct wallet URI. Direct wallet scans bypass the checkout recorder
-and rely on the existing on-chain direct-transfer reconciliation for tracking.
-
-For single-use QRs, `paymentIntentId` can be read through the existing authenticated
-`GET /api/payments/:id` endpoint, and the intent appears in `GET /api/payments`.
-Checkout's existing payment reservation and paid-state checks enforce single use.
-Reusable QRs return `paymentIntentId: null` and do not create a payment intent.
-Each successful API call generates a new link; POST retries are not idempotent.
-
-Errors return JSON with `error` and, for generation errors, `errorCode`:
-
-- **400:** Invalid input, unsupported token, excessive precision, or amount below
-  Sera's swap minimum.
-- **401:** Missing or invalid `X-Api-Key`.
-- **403:** Receiving wallet failed compliance screening.
-- **409:** No executable liquidity or the quote cannot cover the base amount.
-- **422:** The saved branding or logo cannot be rendered.
-- **429:** Rate limited (up to 20 generation requests per minute per IP).
-- **5xx:** Signing, Sera, image rendering/storage, or persistence unavailable.
-
-No single-use intent is created if quoting or rendering fails. Configure
-`PAYMENT_BASE_URL` for the externally accessible checkout origin when self-hosting.
-
-The API calls `renderPaymentQrCard`, also used by the web Download button, with
-a native Node canvas. QR styles, card layout, and drawing functions are shared
-with the webpage. Fonts and the canvas runtime are installed through pnpm;
-the existing Alpine Docker image needs no additional setup.
-
-`pnpm test` includes real image generation and decoding checks for both QR modes
-and all saved styles. Run `pnpm test:qr-image` for the QR API and image tests alone.
-The optional live Alchemy check requires `ALCHEMY_API_KEY`.
+Set `PAYMENT_BASE_URL` to the public checkout origin when self-hosting.
+`pnpm test` includes real QR generation/decoding; `pnpm test:qr-image` runs just
+the QR tests. The optional live Alchemy test requires `ALCHEMY_API_KEY`.
 
 ## Open Source Hygiene
 

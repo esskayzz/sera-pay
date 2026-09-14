@@ -20,12 +20,8 @@ export function createPaymentQrRouter(getExchangeRate: PaymentQrExchangeRate = f
         res.status(400).json({ error: error.issues[0]?.message ?? "Invalid request", errorCode: "invalid_request" });
         return;
       }
-      if (error instanceof PaymentQrError) {
-        res.status(error.status).json({ error: error.message, errorCode: error.errorCode });
-        return;
-      }
-      if (error instanceof QrImageError) {
-        res.status(error.status).json({ error: error.message, errorCode: "qr_image_unavailable" });
+      if (error instanceof PaymentQrError || error instanceof QrImageError) {
+        res.status(error.status).json({ error: error.message, errorCode: error instanceof PaymentQrError ? error.errorCode : "qr_image_unavailable" });
         return;
       }
       if (error instanceof SeraRateLimitedError) {

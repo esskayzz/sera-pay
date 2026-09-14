@@ -174,20 +174,24 @@ afterAll(async () => {
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 });
 
-async function post(body: unknown, key: string | null = "sk_test") {
-  return fetch(`${origin}/api/payment/qr`, {
+async function post(body: unknown, status = 201, key: string | null = "sk_test") {
+  const response = await fetch(`${origin}/api/payment/qr`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...(key === null ? {} : { "X-Api-Key": key }) },
     body: JSON.stringify(body),
   });
+  const result = response.headers.get("Content-Type")?.includes("application/json")
+    ? await response.json()
+    : await response.text();
+  expect(response.status, JSON.stringify(result)).toBe(status);
+  return { body: result, headers: response.headers };
 }
 
 describe("owner QR endpoint", () => {
   it("rejects an invalid saved receiver before screening or quoting", async () => {
     merchant.storeAddress = "invalid-wallet";
-    const response = await post(input);
-    expect(response.status).toBe(400);
-    expect(await response.json()).toMatchObject({ errorCode: "invalid_receiver" });
+    const { body } = await post(input, 400);
+    expect(body).toMatchObject({ errorCode: "invalid_receiver" });
     expect(screenWalletAddress).not.toHaveBeenCalled();
     expect(exchangeRate).not.toHaveBeenCalled();
     expect(renderPaymentQrPng).not.toHaveBeenCalled();
@@ -195,10 +199,9 @@ describe("owner QR endpoint", () => {
 
   it("reports rate backoff with a rounded-up Retry-After header", async () => {
     exchangeRate.mockRejectedValue(new SeraRateLimitedError(1501));
-    const response = await post({ ...input, singleUse: true });
-    expect(response.status).toBe(429);
-    expect(response.headers.get("retry-after")).toBe("2");
-    expect(await response.json()).toMatchObject({ errorCode: "sera_rate_limited" });
+    const { body, headers } = await post({ ...input, singleUse: true }, 429);
+    expect(headers.get("retry-after")).toBe("2");
+    expect(body).toMatchObject({ errorCode: "sera_rate_limited" });
     expect(renderPaymentQrPng).not.toHaveBeenCalled();
     expect(createPaymentIntent).not.toHaveBeenCalled();
   });
@@ -206,41 +209,33 @@ describe("owner QR endpoint", () => {
   it.each([["USDC", -1], ["XSGD", 1.5], ["XSGD", 256]] as const)("rejects invalid %s token precision %s before pricing", async (symbol, decimals) => {
     ENV.seraApiBaseUrl = `https://tokens-${symbol.toLowerCase()}-${String(decimals).replace(".", "-")}.example.test`;
     vi.mocked(getSeraTokens).mockResolvedValue({ tokens: tokens.map(token => token.symbol === symbol ? { ...token, decimals } : token) });
-    const response = await post(input);
-    expect(response.status).toBe(503);
-    expect(await response.json()).toMatchObject({ errorCode: "invalid_config" });
+    const { body } = await post(input, 503);
+    expect(body).toMatchObject({ errorCode: "invalid_config" });
     expect(exchangeRate).not.toHaveBeenCalled();
     expect(renderPaymentQrPng).not.toHaveBeenCalled();
   });
 
   it("keeps the maximum accepted amount exact in the wallet URI", async () => {
-    const response = await post({ ...input, baseAmount: "9007199254.740991", targetCurrency: "USDC" });
-    expect(response.status).toBe(201);
-    const result = await response.json();
+    const { body: result } = await post({ ...input, baseAmount: "9007199254.740991", targetCurrency: "USDC" });
     expect(result.targetAmount).toBe("9007199254.740991");
     expect(result.qrValue).toContain("uint256=9007199254740991");
   });
 
-  it("returns real scannable PNGs for direct, conversion, and single-use payments", async () => {
+  it.each([
+    ["direct", { ...input, targetCurrency: "USDC" }],
+    ["conversion", input],
+    ["single-use", { ...input, targetCurrency: "USDC", singleUse: true }],
+  ])("returns a real scannable PNG for a %s payment", async (kind, input) => {
     const actual = await vi.importActual<typeof import("./qr-image")>("./qr-image");
     vi.mocked(renderPaymentQrPng).mockImplementation(actual.renderPaymentQrPng);
-    for (const body of [
-      { ...input, targetCurrency: "USDC" },
-      input,
-      { ...input, targetCurrency: "USDC", singleUse: true },
-    ]) {
-      const response = await post(body);
-      const result = await response.json();
-      expect(response.status, JSON.stringify(result)).toBe(201);
-      expect(decodeQrCard(result.qrCodeDataUrl)).toEqual({ width: 1440, height: 1840, value: result.qrValue });
-      if (body.targetCurrency === "USDC" && !("singleUse" in body)) expect(result.qrValue).toMatch(/^ethereum:/);
-      else expect(result.qrValue).toBe(result.checkoutUrl);
-    }
+    const { body } = await post(input);
+    expect(decodeQrCard(body.qrCodeDataUrl)).toEqual({ width: 1440, height: 1840, value: body.qrValue });
+    if (kind === "direct") expect(body.qrValue).toMatch(/^ethereum:/);
+    else expect(body.qrValue).toBe(body.checkoutUrl);
   }, 60000);
 
   it.each([null, "wrong-key"])("rejects missing/invalid API keys (%s)", async (key) => {
-    const response = await post(input, key);
-    expect(response.status).toBe(401);
+    await post(input, 401, key);
     expect(renderPaymentQrPng).not.toHaveBeenCalled();
     expect(callSeraApi).not.toHaveBeenCalled();
   });
@@ -248,18 +243,15 @@ describe("owner QR endpoint", () => {
   it("returns a retryable response when API key lookup fails", async () => {
     vi.mocked(getMerchantByApiKey).mockRejectedValueOnce(new Error("Database connection timed out"));
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const response = await post(input);
-    expect(response.status).toBe(503);
-    expect(await response.json()).toEqual({ error: "Database is temporarily unavailable. Please retry." });
+    const { body } = await post(input, 503);
+    expect(body).toEqual({ error: "Database is temporarily unavailable. Please retry." });
     expect(renderPaymentQrPng).not.toHaveBeenCalled();
     expect(callSeraApi).not.toHaveBeenCalled();
   });
 
   it("creates a signed reusable conversion QR using the saved receiving wallet and branding", async () => {
-    const response = await post({ ...input, baseAmount: "00100.000000", baseCurrency: " usdc ", targetCurrency: "xsgd" });
-    const body = await response.json();
-    expect(response.status).toBe(201);
-    expect(response.headers.get("cache-control")).toBe("no-store");
+    const { body, headers } = await post({ ...input, baseAmount: "00100.000000", baseCurrency: " usdc ", targetCurrency: "xsgd" });
+    expect(headers.get("cache-control")).toBe("no-store");
     expect(body).toMatchObject({
       ...input, targetAmount: "130", receiverAddress: RECEIVER, chainId: 1,
       singleUse: false, paymentIntentId: null, requiresCustomerRequote: true,
@@ -280,9 +272,7 @@ describe("owner QR endpoint", () => {
   });
 
   it("persists a single-use intent bound to the signed link and existing paid-state enforcement", async () => {
-    const response = await post({ ...input, singleUse: true });
-    const body = await response.json();
-    expect(response.status).toBe(201);
+    const { body } = await post({ ...input, singleUse: true });
     expect(body.singleUse).toBe(true);
     expect(body.qrValue).toBe(body.checkoutUrl);
     const saved = vi.mocked(createPaymentIntent).mock.calls[0][0];
@@ -306,9 +296,7 @@ describe("owner QR endpoint", () => {
 
   it("supports direct payments without FX or swap liquidity, including wallet fallback", async () => {
     merchant.storeAddress = null;
-    const response = await post({ ...input, targetCurrency: "USDC" });
-    expect(response.status).toBe(201);
-    const body = await response.json();
+    const { body } = await post({ ...input, targetCurrency: "USDC" });
     expect(body).toMatchObject({ targetAmount: "100", receiverAddress: WALLET, requiresCustomerRequote: false });
     expect(body.qrValue).toBe(buildWalletPaymentUri({
       receiverAddress: WALLET, coin: "USDC", amount: "100", chainId: 1,
@@ -320,9 +308,7 @@ describe("owner QR endpoint", () => {
   });
 
   it("keeps single-use same-currency scans on checkout rather than bypassing enforcement", async () => {
-    const response = await post({ ...input, targetCurrency: "USDC", singleUse: true });
-    expect(response.status).toBe(201);
-    const body = await response.json();
+    const { body } = await post({ ...input, targetCurrency: "USDC", singleUse: true });
     expect(body.qrValue).toBe(body.checkoutUrl);
     expect(body.qrValue).not.toMatch(/^ethereum:/);
     expect(verifyCheckoutPayload(body.qrValue.split("/pay/")[1])).toMatchObject({
@@ -357,25 +343,22 @@ describe("owner QR endpoint", () => {
     { ...input, receiverAddress: WALLET }, { ...input, chainId: 137 },
     { baseAmount: "100", baseCurrency: "USDC" }, null, [],
   ])("rejects invalid or overriding request fields: %j", async (body) => {
-    expect((await post(body)).status).toBe(400);
+    await post(body, 400);
     expect(renderPaymentQrPng).not.toHaveBeenCalled();
     expect(createPaymentIntent).not.toHaveBeenCalled();
   });
 
   it("rejects unknown tokens and excess token-specific precision", async () => {
-    const unsupported = await post({ ...input, targetCurrency: "UNKNOWN" });
-    expect(unsupported.status).toBe(400);
-    expect(await unsupported.json()).toMatchObject({ errorCode: "unsupported_token" });
-    const precision = await post({ baseAmount: "10.001", baseCurrency: "IDRT", targetCurrency: "IDRT" });
-    expect(precision.status).toBe(400);
-    expect(await precision.json()).toMatchObject({ errorCode: "invalid_request", field: "baseAmount" });
+    const { body: unsupported } = await post({ ...input, targetCurrency: "UNKNOWN" }, 400);
+    expect(unsupported).toMatchObject({ errorCode: "unsupported_token" });
+    const { body: precision } = await post({ baseAmount: "10.001", baseCurrency: "IDRT", targetCurrency: "IDRT" }, 400);
+    expect(precision).toMatchObject({ errorCode: "invalid_request", field: "baseAmount" });
     expect(renderPaymentQrPng).not.toHaveBeenCalled();
   });
 
   it("does not silently increase the requested payment to meet a swap minimum", async () => {
-    const response = await post({ ...input, baseAmount: "1" });
-    expect(response.status).toBe(400);
-    expect(await response.json()).toMatchObject({ errorCode: "amount_below_min" });
+    const { body } = await post({ ...input, baseAmount: "1" }, 400);
+    expect(body).toMatchObject({ errorCode: "amount_below_min" });
     expect(renderPaymentQrPng).not.toHaveBeenCalled();
   });
 
@@ -388,9 +371,7 @@ describe("owner QR endpoint", () => {
       result.route_params.minOutputAmount = (BigInt(request.from_amount) * 9n / 13n).toString();
       return result;
     });
-    const response = await post(input);
-    expect(response.status).toBe(201);
-    const body = await response.json();
+    const { body } = await post(input);
     expect(Number(body.targetAmount)).toBeGreaterThan(130);
     expect(verifyCheckoutPayload(body.checkoutUrl.split("/pay/")[1])).toMatchObject({
       amount: "100", payAmount: body.targetAmount,
@@ -400,9 +381,8 @@ describe("owner QR endpoint", () => {
 
   it("surfaces Sera outages without creating a link", async () => {
     vi.mocked(callSeraApi).mockRejectedValue(new SeraApiError(503, "unavailable"));
-    const response = await post({ ...input, singleUse: true });
-    expect(response.status).toBe(503);
-    expect(await response.json()).toMatchObject({ errorCode: "sera_unavailable" });
+    const { body } = await post({ ...input, singleUse: true }, 503);
+    expect(body).toMatchObject({ errorCode: "sera_unavailable" });
     expect(createPaymentIntent).not.toHaveBeenCalled();
     expect(renderPaymentQrPng).not.toHaveBeenCalled();
   });
@@ -413,9 +393,8 @@ describe("owner QR endpoint", () => {
       if (options.path === "/swap/quote") throw new SeraApiError(409, "No liquidity", null, "NO_LIQUIDITY");
       return implementation(options);
     });
-    const response = await post({ ...input, singleUse: true });
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({ errorCode: "no_liquidity" });
+    const { body } = await post({ ...input, singleUse: true }, 409);
+    expect(body).toMatchObject({ errorCode: "no_liquidity" });
     expect(renderPaymentQrPng).not.toHaveBeenCalled();
     expect(createPaymentIntent).not.toHaveBeenCalled();
   });
@@ -425,7 +404,7 @@ describe("owner QR endpoint", () => {
       address: RECEIVER, status: "blocked", blocked: true, identifications: [],
       provider: "chainalysis-sanctions", checkType: "recipient_wallet", message: "Blocked",
     });
-    expect((await post(input)).status).toBe(403);
+    await post(input, 403);
     expect(callSeraApi).not.toHaveBeenCalled();
     expect(renderPaymentQrPng).not.toHaveBeenCalled();
   });
@@ -440,33 +419,29 @@ describe("owner QR endpoint", () => {
       seraApiKeyLast4: null, seraWebhookSecretEncrypted: null, seraWebhookSecretLast4: null,
       createdAt: new Date(), updatedAt: new Date(),
     });
-    const response = await post({ ...input, targetCurrency: "USDC" });
-    expect(response.status).toBe(201);
-    const body = await response.json();
+    const { body } = await post({ ...input, targetCurrency: "USDC" });
     expect(body.chainId).toBe(chainId);
     expect(verifyCheckoutPayload(body.checkoutUrl.split("/pay/")[1])?.chainId).toBe(chainId);
   });
 
   it("returns rendering errors without leaving an intent behind", async () => {
     vi.mocked(renderPaymentQrPng).mockRejectedValue(new QrImageError("Unable to load merchant logo", 422));
-    const response = await post({ ...input, singleUse: true });
-    expect(response.status).toBe(422);
-    expect(await response.json()).toMatchObject({ errorCode: "qr_image_unavailable" });
+    const { body } = await post({ ...input, singleUse: true }, 422);
+    expect(body).toMatchObject({ errorCode: "qr_image_unavailable" });
     expect(createPaymentIntent).not.toHaveBeenCalled();
   });
 
   it("returns a failure rather than a usable-looking response if persistence fails", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     vi.mocked(createPaymentIntent).mockRejectedValue(new Error("database down"));
-    const response = await post({ ...input, singleUse: true });
-    expect(response.status).toBe(500);
-    expect(await response.json()).toEqual({ error: "Unable to generate payment QR", errorCode: "internal_error" });
+    const { body } = await post({ ...input, singleUse: true }, 500);
+    expect(body).toEqual({ error: "Unable to generate payment QR", errorCode: "internal_error" });
   });
 
   it("fails closed when production checkout signing is unavailable", async () => {
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("SESSION_SECRET", "");
-    expect((await post(input)).status).toBe(503);
+    await post(input, 503);
     expect(renderPaymentQrPng).not.toHaveBeenCalled();
     expect(createPaymentIntent).not.toHaveBeenCalled();
   });

@@ -1408,38 +1408,50 @@ async function cancelStaleMerchantTransactions(merchantId: string, transactions?
   return canceled;
 }
 
-const PROVIDER_CODES = new Set([
-  "ALLOWANCE_INSUFFICIENT", "INTENT_DEADLINE_EXPIRED", "SLIPPAGE_EXCEEDED", "STP_BLOCKED",
-]);
-const PAYMENT_ERROR_MESSAGES = new Map([
-  ["no_liquidity", "Currently there's no liquidity on this exchange in Sera.cx. Please try another option."],
-  ["quote_stale", "This quote closed before it could be submitted. Please try again."],
-  ["sera_unavailable", "Sera is temporarily unavailable. Please try again shortly."],
-  ["sera_rate_limited", "Sera is receiving too many requests. Please try again shortly."],
-  ["amount_below_min", "This payment amount is below Sera's minimum for this currency pair."],
-]);
-
-function paymentErrorCode(error: SeraApiError): string {
-  const code = String(error.errorCode || "").toUpperCase();
-  if (code === "NO_LIQUIDITY" || code === "PAIR_INACTIVE") return "no_liquidity";
-  if (code === "AMOUNT_BELOW_MIN") return "amount_below_min";
-  if (code === "QUOTE_STALE" || error.status === 410) return "quote_stale";
-  if (PROVIDER_CODES.has(code)) return code.toLowerCase();
-  if (error.status === 429) return "sera_rate_limited";
-  if (error.status >= 500) return "sera_unavailable";
-  return code.toLowerCase() || "invalid_quote";
-}
-
 export function seraPaymentErrorResponse(error: unknown, fallback: string) {
   const quoteError = serializeSeraQuoteError(error);
   if (quoteError) return quoteError;
   if (error instanceof SeraApiError) {
-    const errorCode = paymentErrorCode(error);
+    const providerCode = String(error.errorCode || "").toUpperCase();
+    const isQuoteStale = providerCode === "QUOTE_STALE";
+    const isUnavailable = error.status >= 500;
+    const stableCode = providerCode === "NO_LIQUIDITY" || providerCode === "PAIR_INACTIVE"
+      ? "no_liquidity"
+      : providerCode === "AMOUNT_BELOW_MIN"
+        ? "amount_below_min"
+        : isQuoteStale || error.status === 410
+          ? "quote_stale"
+          : providerCode === "ALLOWANCE_INSUFFICIENT"
+            ? "allowance_insufficient"
+            : providerCode === "INTENT_DEADLINE_EXPIRED"
+              ? "intent_deadline_expired"
+              : providerCode === "SLIPPAGE_EXCEEDED"
+                ? "slippage_exceeded"
+                : providerCode === "STP_BLOCKED"
+                  ? "stp_blocked"
+                  : error.status === 429
+                    ? "sera_rate_limited"
+                    : isUnavailable
+                      ? "sera_unavailable"
+                      : providerCode
+                        ? providerCode.toLowerCase()
+                        : "invalid_quote";
+    const message = stableCode === "no_liquidity"
+      ? "Currently there's no liquidity on this exchange in Sera.cx. Please try another option."
+      : stableCode === "quote_stale"
+        ? "This quote closed before it could be submitted. Please try again."
+        : stableCode === "sera_unavailable"
+          ? "Sera is temporarily unavailable. Please try again shortly."
+          : stableCode === "sera_rate_limited"
+            ? "Sera is receiving too many requests. Please try again shortly."
+            : stableCode === "amount_below_min"
+              ? "This payment amount is below Sera's minimum for this currency pair."
+              : fallback;
     return {
       status: error.status >= 400 && error.status < 500 ? error.status : 503,
       body: {
-        error: PAYMENT_ERROR_MESSAGES.get(errorCode) ?? fallback,
-        errorCode,
+        error: message,
+        errorCode: stableCode,
         seraStatus: error.status,
       },
     };
